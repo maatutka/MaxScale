@@ -267,7 +267,11 @@ static bool handle_error_new_connection(
         ROUTER_CLIENT_SES* rses,
         DCB*               backend_dcb,
         GWBUF*             errmsg);
-static void handle_error_reply_client(SESSION* ses, GWBUF* errmsg);
+static void handle_error_reply_client(
+		SESSION*           ses, 
+		ROUTER_CLIENT_SES* rses, 
+		DCB*               backend_dcb,
+		GWBUF*             errmsg);
 
 static backend_ref_t* get_root_master_bref(ROUTER_CLIENT_SES* rses);
 
@@ -1212,7 +1216,6 @@ static bool get_dcb(
 				"the service %s.",
 				rses->router->service->name)));
 		}
-                ss_dassert(succp);
         }
 
         if (btype == BE_MASTER)
@@ -1685,9 +1688,9 @@ void check_create_tmp_table(
  * for buffering the partial query, a later call to the query router will
  * contain the remainder, or part thereof of the query.
  *
- * @param instance	The query router instance
- * @param session	The session associated with the client
- * @param queue		MaxScale buffer queue with the packets received
+ * @param instance		The query router instance
+ * @param router_session	The session associated with the client
+ * @param querybuf		MaxScale buffer queue with received packet
  *
  * @return if succeed 1, otherwise 0
  * If routeQuery fails, it means that router session has failed.
@@ -4116,7 +4119,7 @@ static void handleError (
         
         switch (action) {
                 case ERRACT_NEW_CONNECTION:
-                {               
+                {
                         if (!rses_begin_locked_router_action(rses))
                         {
                                 *succp = false;
@@ -4134,7 +4137,6 @@ static void handleError (
 				
 				*succp = false;
 				rses_end_locked_router_action(rses);
-				return;
 			}
 			/**
 			 * This is called in hope of getting replacement for 
@@ -4150,7 +4152,10 @@ static void handleError (
                 
                 case ERRACT_REPLY_CLIENT:
                 {
-                        handle_error_reply_client(session, errmsgbuf);
+                        handle_error_reply_client(session, 
+						  rses, 
+						  backend_dcb, 
+						  errmsgbuf);
 			*succp = false; /*< no new backend servers were made available */
                         break;       
                 }
@@ -4163,16 +4168,29 @@ static void handleError (
 
 
 static void handle_error_reply_client(
-	SESSION* ses,
-	GWBUF*   errmsg)
+	SESSION*           ses,
+	ROUTER_CLIENT_SES* rses,
+	DCB*               backend_dcb,
+	GWBUF*             errmsg)
 {
 	session_state_t sesstate;
 	DCB*            client_dcb;
+	backend_ref_t*  bref;
 	
 	spinlock_acquire(&ses->ses_lock);
 	sesstate = ses->state;
 	client_dcb = ses->client;
 	spinlock_release(&ses->ses_lock);
+
+	/**
+	 * If bref exists, mark it closed
+	 */
+	if ((bref = get_bref_from_dcb(rses, backend_dcb)) != NULL)
+	{
+		CHK_BACKEND_REF(bref);
+		bref_clear_state(bref, BREF_IN_USE);
+		bref_set_state(bref, BREF_CLOSED);
+	}
 	
 	if (sesstate == SESSION_STATE_ROUTER_READY)
 	{
