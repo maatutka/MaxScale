@@ -43,7 +43,13 @@
 #include <skygw_utils.h>
 #include <log_manager.h>
 
-extern int lm_enabled_logfiles_bitmask;
+/** Defined in log_manager.cc */
+extern int            lm_enabled_logfiles_bitmask;
+extern size_t         log_ses_count[];
+extern __thread log_info_t tls_log_info;
+
+/** Global session id; updated safely by holding session_spin */
+static size_t session_id;
 
 static SPINLOCK	session_spin = SPINLOCK_INIT;
 static SESSION	*allSessions = NULL;
@@ -71,15 +77,14 @@ session_alloc(SERVICE *service, DCB *client_dcb)
         ss_info_dassert(session != NULL,
                         "Allocating memory for session failed.");
         
-        if (session == NULL) {
-                int eno = errno;
-                errno = 0;
+        if (session == NULL) 
+	{
                 LOGIF(LE, (skygw_log_write_flush(
                         LOGFILE_ERROR,
                         "Error : Failed to allocate memory for "
                         "session object due error %d, %s.",
-                        eno,
-                        strerror(eno))));
+                        errno,
+                        strerror(errno))));
 		goto return_session;
         }
 #if defined(SS_DEBUG)
@@ -216,16 +221,71 @@ session_alloc(SERVICE *service, DCB *client_dcb)
                 session->state = SESSION_STATE_ROUTER_READY;
 		spinlock_release(&session->ses_lock);		
 		spinlock_acquire(&session_spin);
+		/** Assign a session id and increase */
+		session->ses_id = ++session_id; 
 		session->next = allSessions;
                 allSessions = session;
                 spinlock_release(&session_spin);
                 
+		if (session->client->user == NULL)
+		{
+			LOGIF(LT, (skygw_log_write(
+				LOGFILE_TRACE,
+				"Started session [%lu] for %s service ",
+				session->ses_id,
+				service->name)));
+		}
+		else
+		{
+			LOGIF(LT, (skygw_log_write(
+				LOGFILE_TRACE,
+				"Started %s client session [%lu] for '%s' from %s",
+				service->name,
+				session->ses_id,
+				session->client->user,
+				session->client->remote)));			
+		}
 		atomic_add(&service->stats.n_sessions, 1);
                 atomic_add(&service->stats.n_current, 1);
                 CHK_SESSION(session);
         }        
 return_session:
 	return session;
+}
+
+/**
+ * Enable specified logging for the current session and increase logger 
+ * counter.
+ * Generic logging setting has precedence over session-specific setting.
+ * 
+ * @param ses	session 
+ * @param id	logfile identifier
+ */
+void session_enable_log(
+	SESSION*     ses,
+	logfile_id_t id)
+{
+	ses->ses_enabled_logs |= id;
+	atomic_add((int *)&log_ses_count[id], 1);
+}
+
+/**
+ * Disable specified logging for the current session and decrease logger
+ * counter.
+ * Generic logging setting has precedence over session-specific setting.
+ * 
+ * @param ses	session
+ * @param id	logfile identifier
+ */
+void session_disable_log(
+	SESSION* ses, 
+	logfile_id_t id)
+{
+	if (ses->ses_enabled_logs & id)
+	{
+		ses->ses_enabled_logs &= ~id;
+		atomic_add((int *)&log_ses_count[id], -1);
+	}
 }
 
 /**
@@ -352,6 +412,16 @@ bool session_free(
 		}
 		free(session->filters);
 	}
+	
+	LOGIF(LT, (skygw_log_write(
+		LOGFILE_TRACE,
+		"Stopped %s client session [%lu]",
+		session->service->name,
+		session->ses_id)));
+	
+	/** Disable trace and decrease trace logger counter */
+	session_disable_log(session, LT);
+	
 	free(session);
         succp = true;
         
@@ -502,7 +572,7 @@ SESSION	*ptr;
 	ptr = allSessions;
 	while (ptr)
 	{
-		dcb_printf(dcb, "Session %p\n", ptr);
+		dcb_printf(dcb, "Session %d (%p)\n",ptr->ses_id, ptr);
 		dcb_printf(dcb, "\tState:    		%s\n", session_state(ptr->state));
 		dcb_printf(dcb, "\tService:		%s (%p)\n", ptr->service->name, ptr->service);
 		dcb_printf(dcb, "\tClient DCB:		%p\n", ptr->client);
@@ -528,7 +598,7 @@ dprintSession(DCB *dcb, SESSION *ptr)
 {
 int	i;
 
-	dcb_printf(dcb, "Session %p\n", ptr);
+	dcb_printf(dcb, "Session %d (%p)\n",ptr->ses_id, ptr);
 	dcb_printf(dcb, "\tState:    		%s\n", session_state(ptr->state));
 	dcb_printf(dcb, "\tService:		%s (%p)\n", ptr->service->name, ptr->service);
 	dcb_printf(dcb, "\tClient DCB:		%p\n", ptr->client);
@@ -782,4 +852,12 @@ char *
 session_getUser(SESSION *session)
 {
 	return (session && session->client) ? session->client->user : NULL;
+}
+/**
+ * Return the pointer to the list of all sessions.
+ * @return Pointer to the list of all sessions.
+ */
+SESSION *get_all_sessions()
+{
+	return allSessions;
 }

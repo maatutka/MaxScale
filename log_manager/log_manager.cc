@@ -59,18 +59,23 @@ static simple_mutex_t msg_mutex;
 int lm_enabled_logfiles_bitmask = 0;
 
 /**
+ * Thread-specific struct variable for storing current session id and currently 
+ * enabled log files for the session. 
+ */
+__thread log_info_t tls_log_info = {0, 0};
+
+/**
+ * Global counter for each log file type. It indicates for how many sessions 
+ * each log type is currently enabled.
+ */
+ssize_t log_ses_count[LOGFILE_LAST] = {0};
+
+/**
  * BUFSIZ comes from the system. It equals with block size or
  * its multiplication.
  */
 #define MAX_LOGSTRLEN BUFSIZ
 
-#if defined(SS_PROF)
-/**
- * These counters may be inaccurate but give some idea of how
- * things are going.
- */
-
-#endif
 /**
  * Path to directory in which all files are stored to shared memory
  * by the OS.
@@ -236,7 +241,7 @@ static void logfile_flush(logfile_t* lf);
 static void logfile_rotate(logfile_t* lf);
 static bool logfile_create(logfile_t* lf);
 static bool logfile_open_file(filewriter_t* fw, logfile_t* lf);
-static char* form_full_file_name(strpart_t* parts, int seqno, int seqnoidx);
+static char* form_full_file_name(strpart_t* parts, logfile_t* lf, int seqnoidx);
 
 static bool filewriter_init(
         logmanager_t*    logmanager,
@@ -285,6 +290,7 @@ static bool check_file_and_path(
 
 static bool  file_is_symlink(char* filename);
 static int skygw_log_disable_raw(logfile_id_t id, bool emergency); /*< no locking */
+static int find_last_seqno(strpart_t* parts, int seqno, int seqnoidx);
 
 
 const char* get_suffix_default(void)
@@ -720,17 +726,28 @@ static int logmanager_write_log(
 	{
                 /** Length of string that will be written, limited by bufsize */
                 int safe_str_len; 
+		/** Length of session id */
+		int sesid_str_len;
 
+		/** 2 braces and 2 spaces */
+		if (id == LOGFILE_TRACE && tls_log_info.li_sesid != 0)
+		{
+			sesid_str_len = 2+2+get_decimal_len(tls_log_info.li_sesid); 
+		}
+		else
+		{
+			sesid_str_len = 0;
+		}			
                 timestamp_len = get_timestamp_len();
                 
-                /** Findout how much can be safely written with current block size */
-                if (timestamp_len-1+str_len > lf->lf_buf_size)
+                /** Find out how much can be safely written with current block size */
+		if (timestamp_len-1+sesid_str_len+str_len > lf->lf_buf_size)
 		{
 			safe_str_len = lf->lf_buf_size;
 		}
                 else
 		{
-			safe_str_len = timestamp_len-1+str_len;
+			safe_str_len = timestamp_len-1+sesid_str_len+str_len;
 		}
                 /**
                  * Seek write position and register to block buffer.
@@ -761,7 +778,7 @@ static int logmanager_write_log(
 			simple_mutex_unlock(&msg_mutex);
 		}
 #endif
-
+		/** Book space for log string from buffer */
                 wp = blockbuf_get_writepos(&bb,
                                            id,
                                            safe_str_len,
@@ -783,16 +800,30 @@ static int logmanager_write_log(
                  */
                 timestamp_len = snprint_timestamp(wp, timestamp_len);
 		
-
-
+		if (sesid_str_len != 0)
+		{
+			/**
+			 * Write session id
+			 */
+			snprintf(wp+timestamp_len, 
+				 sesid_str_len, 
+				 "[%lu]  ", 
+				 tls_log_info.li_sesid);
+		}
                 /**
                  * Write next string to overwrite terminating null character
                  * of the timestamp string.
                  */
                 if (use_valist) {
-                        vsnprintf(wp+timestamp_len, safe_str_len-timestamp_len, str, valist);
+                        vsnprintf(wp+timestamp_len+sesid_str_len, 
+				  safe_str_len-timestamp_len-sesid_str_len, 
+				  str, 
+				  valist);
                 } else {
-                        snprintf(wp+timestamp_len, safe_str_len-timestamp_len, "%s", str);
+                        snprintf(wp+timestamp_len+sesid_str_len,
+				 safe_str_len-timestamp_len-sesid_str_len, 
+				 "%s", 
+				 str);
                 }
 
                 /** write to syslog */
@@ -1042,21 +1073,46 @@ static char* blockbuf_get_writepos(
 		}else if(bb->bb_state == BB_CLEARED){
 
 		  /**
-		   *Move the full buffer to the end of the list
+		   *Move the cleared buffer to the end of the list if it is the first one in the list
 		   */
 
 		      simple_mutex_unlock(&bb->bb_mutex);
 		      simple_mutex_lock(&bb_list->mlist_mutex, true);
 		      
-		      if(node->mlnode_next){
-			bb_list->mlist_first = node->mlnode_next;
-			bb_list->mlist_last->mlnode_next = node;
-			node->mlnode_next = NULL;
-			bb_list->mlist_last = node;
-			node = bb_list->mlist_first;
-		      }
+		      if(node == bb_list->mlist_first)
+				  {
 
-		      bb->bb_state = BB_READY;
+					  if(bb_list->mlist_nodecount > 1 &&
+						 node != bb_list->mlist_last){
+						  bb_list->mlist_last->mlnode_next = bb_list->mlist_first;
+						  bb_list->mlist_first = bb_list->mlist_first->mlnode_next;
+						  bb_list->mlist_last->mlnode_next->mlnode_next = NULL;
+						  bb_list->mlist_last = bb_list->mlist_last->mlnode_next;
+					  }
+
+					  ss_dassert(node == bb_list->mlist_last);
+
+					  simple_mutex_unlock(&bb_list->mlist_mutex);
+					  simple_mutex_lock(&bb->bb_mutex, true);
+
+					  bb->bb_state = BB_READY;
+
+					  simple_mutex_unlock(&bb->bb_mutex);
+					  simple_mutex_lock(&bb_list->mlist_mutex, true);
+					  
+				  }
+			  else
+				  {
+					  if(node->mlnode_next){
+						  node = node->mlnode_next;
+					  }else{
+						  node = bb_list->mlist_first;
+					  }
+					  continue;
+				  }
+
+
+			  
 
 		    }else if (bb->bb_state == BB_READY){
                     /**
@@ -1181,10 +1237,10 @@ int skygw_log_enable(
 {
         bool err = 0;
 
-        if (!logmanager_register(true)) {
-            //fprintf(stderr, "ERROR: Can't register to logmanager\n");
-            err = -1;
-            goto return_err;
+        if (!logmanager_register(true)) 
+	{
+		err = -1;
+		goto return_err;
         }
         CHK_LOGMANAGER(lm);
 
@@ -1316,19 +1372,21 @@ int skygw_log_write_flush(
         va_list valist;
         size_t  len;
 
-        if (!logmanager_register(true)) {
-            //fprintf(stderr, "ERROR: Can't register to logmanager\n");
-            err = -1;
-            goto return_err;
+        if (!logmanager_register(true)) 
+	{
+		err = -1;
+		goto return_err;
         }
         CHK_LOGMANAGER(lm);
 
-        /**
-         * If particular log is disabled only unregister and return.
-         */
-        if (!(lm->lm_enabled_logfiles & id)) {
-            err = 1;
-            goto return_unregister;
+	/**
+	 * If particular log is disabled in general and it is not enabled for
+	 * the current session, then unregister and return.
+	 */
+	if (!LOG_IS_ENABLED(id)) 
+	{
+		err = 1;
+		goto return_unregister;
         }
         /**
          * Find out the length of log string (to be formatted str).
@@ -1369,17 +1427,19 @@ int skygw_log_write(
         va_list valist;
         size_t  len;
         
-        if (!logmanager_register(true)) {
-            //fprintf(stderr, "ERROR: Can't register to logmanager\n");
-            err = -1;
-            goto return_err;
+        if (!logmanager_register(true)) 
+	{
+		err = -1;
+		goto return_err;
         }
         CHK_LOGMANAGER(lm);
 
         /**
-         * If particular log is disabled only unregister and return.
+         * If particular log is disabled in general and it is not enabled for
+	 * the current session, then unregister and return.
          */
-        if (!(lm->lm_enabled_logfiles & id)) {
+        if (!LOG_IS_ENABLED(id))
+	{
                 err = 1;
                 goto return_unregister;
         }
@@ -1928,6 +1988,11 @@ static void logfile_rotate(
  * @param lf	logfile pointer
  * 
  * @return true if succeed, false if failed
+ * 
+ * @note 	Log file openings are not TOCTOU-safe. It is not likely that 
+ * multiple copies of same files are opened in parallel but it is possible by 
+ * using log manager in parallel with multiple processes and by configuring 
+ * log manager to use same directories among those processes.
  */
 static bool logfile_create(
 	logfile_t* lf)
@@ -1962,7 +2027,7 @@ static bool logfile_create(
 		 * suffix (index == 2)
 		 */
 		lf->lf_full_file_name =
-			form_full_file_name(spart, lf->lf_name_seqno, 2);
+			form_full_file_name(spart, lf, 2);
 		
 		if (store_shmem) 
 		{
@@ -1970,10 +2035,7 @@ static bool logfile_create(
 			/**
 			 * Create name for link file
 			 */
-			lf->lf_full_link_name = form_full_file_name(
-							spart,
-							lf->lf_name_seqno,
-							2);
+			lf->lf_full_link_name = form_full_file_name(spart,lf,2);
 		}
 		/**
 		 * At least one of the files couldn't be created. Increase
@@ -2141,38 +2203,37 @@ return_succp:
  * @node Combine all name parts from left to right. 
  *
  * Parameters:
- * @param parts - <usage>
- *          <description>
+ * @param parts 
  *
- * @param seqno - in, use
- *          specifies the the sequence number which will be added as a part
- *          of full file name.
- *          seqno == -1 indicates that sequence number won't be used.
+ * @param seqno specifies the the sequence number which will be added as a part
+ * of full file name. seqno == -1 indicates that sequence number won't be used.
  *
- * @param seqnoidx - in, use
- *          Specifies the seqno position in the 'array' of name parts.
- *          If seqno == -1 seqnoidx will be set -1 as well.
+ * @param seqnoidx Specifies the seqno position in the 'array' of name parts.
+ * If seqno == -1 seqnoidx will be set -1 as well.
  *
  * @return Pointer to filename, of NULL if failed.
  *
  * 
- * @details (write detailed description here)
- *
  */
 static char* form_full_file_name(
         strpart_t* parts,
-        int        seqno,
+	logfile_t* lf,
         int        seqnoidx)
 {
         int    i;
+	int    seqno;
         size_t s;
         size_t fnlen;
         char*  filename = NULL;
         char*  seqnostr = NULL;
         strpart_t* p;
-
-        if (seqno != -1)
+		
+        if (lf->lf_name_seqno != -1)
         {
+		lf->lf_name_seqno = find_last_seqno(parts, 
+						    lf->lf_name_seqno, 
+						    seqnoidx);	
+		seqno = lf->lf_name_seqno;		
                 s = UINTLEN(seqno);
                 seqnostr = (char *)malloc((int)s+1);
         }
@@ -2184,6 +2245,7 @@ static char* form_full_file_name(
                  */
                 s = 0;
                 seqnoidx = -1;
+		seqno = lf->lf_name_seqno;
         }
         
         if (parts == NULL || parts->sp_string == NULL) {
@@ -2206,8 +2268,9 @@ static char* form_full_file_name(
                 }
                 p = p->sp_next;
         }
-                
-        if (fnlen > NAME_MAX) {
+
+        if (fnlen > NAME_MAX) 
+	{
                 fprintf(stderr, "Error : Too long file name= %d.\n", (int)fnlen);
                 goto return_filename;
         }
@@ -2274,11 +2337,10 @@ static char* add_slash(
  * check if they are accessible and writable.
  * 
  * Parameters:
- * @param filename - <usage>
- *          <description>
+ * @param filename	file to be checked
  *
- * @param writable - <usage>
- *          <description>
+ * @param writable	flag indicating whether file was found writable or not
+ * if writable is NULL, check is skipped.
  *
  * @return true & writable if file exists and it is writable, 
  * 	true & not writable if file exists but it can't be written, 
@@ -2299,7 +2361,11 @@ static bool check_file_and_path(
 	if (filename == NULL)
 	{
 		exists = false;
-		*writable = false;
+		
+		if (writable)
+		{
+			*writable = false;
+		}
 	}
 	else
 	{
@@ -2320,23 +2386,29 @@ static bool check_file_and_path(
 						"to %s.\n",
 						filename,
 						strerror(errno));
-					*writable = false;
-				}
-				else
-				{
-					char c = ' ';
-					if (write(fd, &c, 1) == 1)
-					{                                        
-						*writable = true;
-					}
-					else
+					if (writable)
 					{
-						fprintf(stderr,
-							"*\n* Error : Can't write to "
-							"%s due to %s.\n", 
-							filename,
-							strerror(errno));
 						*writable = false;
+					}
+				}
+				else 
+				{
+					if (writable)
+					{
+						char c = ' ';
+						if (write(fd, &c, 1) == 1)
+						{                                        
+							*writable = true;
+						}
+						else
+						{
+							fprintf(stderr,
+								"*\n* Error : Can't write to "
+								"%s due to %s.\n", 
+								filename,
+								strerror(errno));
+							*writable = false;
+						}
 					}
 					close(fd);
 				}
@@ -2349,7 +2421,11 @@ static bool check_file_and_path(
 					filename,
 					strerror(errno));
 				exists = false;
-				*writable = false;
+				
+				if (writable)
+				{
+					*writable = false;
+				}
 			}
 		}
 		else
@@ -2357,7 +2433,11 @@ static bool check_file_and_path(
 			close(fd);
 			unlink(filename);
 			exists = false;
-			*writable = true;
+			
+			if (writable)
+			{
+				*writable = true;
+			}
 		}
 	}
 	return exists;
@@ -2404,8 +2484,6 @@ static bool file_is_symlink(
  *
  * @return true if succeed, false otherwise
  *
- * 
- * @details (write detailed description here)
  *
  */
 static bool logfile_init(
@@ -2493,6 +2571,7 @@ static bool logfile_init(
                 logfile_free_memory(logfile);
                 goto return_with_succp;
         }
+#if defined(SS_DEBUG)
         if (store_shmem)
 	{
 		fprintf(stderr, "%s\t: %s->%s\n", 
@@ -2506,6 +2585,7 @@ static bool logfile_init(
 			STRLOGNAME(logfile_id),
 			logfile->lf_full_file_name);
 	}
+#endif
         succp = true;
         logfile->lf_state = RUN;
         CHK_LOGFILE(logfile);
@@ -2701,7 +2781,8 @@ static void filewriter_done(
  * by file writer which traverses the list and accesses block buffers
  * included in list nodes.
  * List modifications are protected with version numbers.
- * Before modification, version is increased by one to be odd. After the
+ * Before
+ modification, version is increased by one to be odd. After the
  * completion, it is increased again to even. List can be read only when
  * version is even and read is consistent only if version hasn't changed
  * during the read.
@@ -2930,4 +3011,65 @@ static void fnames_conf_free_memory(
         if (fn->fn_err_prefix != NULL)   free(fn->fn_err_prefix);
         if (fn->fn_err_suffix != NULL)   free(fn->fn_err_suffix);
         if (fn->fn_logpath != NULL)      free(fn->fn_logpath);
+}
+
+/**
+ * Find the file with biggest sequence number from given directory and return 
+ * the sequence number.
+ * 
+ * @param parts	string parts of which the file name is composed of
+ * @param seqno	the sequence number to start with, if seqno is -1 just return
+ * 
+ * @return the biggest sequence number used  
+ */
+static int find_last_seqno(
+	strpart_t* parts, 
+	int        seqno,
+	int        seqnoidx)
+{
+	strpart_t* p;
+	char*      snstr;
+	int        snstrlen;
+	
+	if (seqno == -1)
+	{
+		return seqno;
+	}
+	snstrlen = UINTLEN(INT_MAX);
+	snstr = (char *)calloc(1, snstrlen);
+	p = parts;
+	
+	while (true)
+	{
+		int  i;
+		char filename[NAME_MAX] = {0};
+		/** Form name with next seqno */
+		snprintf(snstr, snstrlen, "%d", seqno+1);
+		
+		for (i=0, p=parts; p->sp_string != NULL; i++, p=p->sp_next)
+		{
+			if (snstr != NULL && i == seqnoidx && strnlen(snstr,NAME_MAX) < NAME_MAX)
+			{
+				strcat(filename, snstr); /*< add sequence number */
+			}
+			strcat(filename, p->sp_string);
+			
+			if (p->sp_next == NULL)
+			{
+				break;
+			}
+		}
+		
+		if (check_file_and_path(filename, NULL))
+		{
+			seqno++;
+		}
+		else
+		{
+			break;
+		}
+	}
+	free(snstr);
+
+	return seqno;
 }

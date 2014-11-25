@@ -45,7 +45,10 @@
 #include <skygw_utils.h>
 #include <log_manager.h>
 
-extern int lm_enabled_logfiles_bitmask;
+/** Defined in log_manager.cc */
+extern int            lm_enabled_logfiles_bitmask;
+extern size_t         log_ses_count[];
+extern __thread log_info_t tls_log_info;
 
 extern int gw_read_backend_event(DCB* dcb);
 extern int gw_write_backend_event(DCB *dcb);
@@ -1790,13 +1793,13 @@ void protocol_archive_srv_command(
         }
         
         s1 = &p->protocol_command;
-        
+#if defined(EXTRA_SS_DEBUG)
         LOGIF(LT, (skygw_log_write(
                 LOGFILE_TRACE,
                 "Move command %s from fd %d to command history.",
                 STRPACKETTYPE(s1->scom_cmd), 
                 p->owner_dcb->fd)));
-        
+#endif
         /** Copy to history list */
         if ((h1 = p->protocol_cmd_history) == NULL)
         {
@@ -1847,7 +1850,7 @@ void protocol_add_srv_command(
         MySQLProtocol*     p,
         mysql_server_cmd_t cmd)
 {
-#if defined(SS_DEBUG)
+#if defined(EXTRA_SS_DEBUG)
         server_command_t* c;
 #endif
         spinlock_acquire(&p->protocol_lock);
@@ -1867,14 +1870,13 @@ void protocol_add_srv_command(
                 /** add to the end of list */
                 p->protocol_command.scom_next = server_command_init(NULL, cmd);
         }
-        
+#if defined(EXTRA_SS_DEBUG)        
         LOGIF(LT, (skygw_log_write(
                 LOGFILE_TRACE,
                 "Added command %s to fd %d.",
                 STRPACKETTYPE(cmd),
                 p->owner_dcb->fd)));
         
-#if defined(SS_DEBUG)
         c = &p->protocol_command;
 
         while (c != NULL && c->scom_cmd != MYSQL_COM_UNDEFINED)
@@ -1905,13 +1907,13 @@ void protocol_remove_srv_command(
         server_command_t* s;
         spinlock_acquire(&p->protocol_lock);
         s = &p->protocol_command;
-        
+#if defined(EXTRA_SS_DEBUG)
         LOGIF(LT, (skygw_log_write(
                 LOGFILE_TRACE,
                 "Removed command %s from fd %d.",
                 STRPACKETTYPE(s->scom_cmd),
                 p->owner_dcb->fd)));
-        
+#endif
         if (s->scom_next == NULL)
         {
                 p->protocol_command.scom_cmd = MYSQL_COM_UNDEFINED;
