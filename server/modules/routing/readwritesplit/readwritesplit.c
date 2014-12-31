@@ -2353,6 +2353,14 @@ static bool route_single_stmt(
 			"master" : "slave"),
 			bref->bref_backend->backend_server->name,
 			bref->bref_backend->backend_server->port)));
+#if 1
+		/** Add new statement to the end of pending command list */
+		bref->bref_pending_cmd = gwbuf_append(
+						bref->bref_pending_cmd, 
+						gwbuf_clone(querybuf));
+		
+		
+#endif
 		/** 
 		 * Store current stmt if execution of previous session command 
 		 * haven't completed yet.
@@ -2367,14 +2375,24 @@ static bool route_single_stmt(
 		 * somehow wrong, or client is sending more queries before 
 		 * previous is received.
 		 */
-		if (sescmd_cursor_is_active(scur))
+		if (BREF_IS_WAITING_RESULT(bref) || sescmd_cursor_is_active(scur))
 		{
+#if 0
 			ss_dassert(bref->bref_pending_cmd == NULL);
 			bref->bref_pending_cmd = gwbuf_clone(querybuf);
 			
+#endif
 			rses_end_locked_router_action(rses);
 			goto retblock;
 		}
+#if 1
+		/** reassign querybuf with the first statement on the list */
+		querybuf = gwbuf_clone_portion(bref->bref_pending_cmd, 0, GWBUF_LENGTH(bref->bref_pending_cmd));
+		bref->bref_pending_cmd = gwbuf_consume(bref->bref_pending_cmd, 
+						GWBUF_LENGTH(bref->bref_pending_cmd));
+		/** Write the first statement from the pending command list */
+#endif
+		ss_dassert(!BREF_IS_WAITING_RESULT(bref));
 		
 		if ((ret = target_dcb->func.write(target_dcb, gwbuf_clone(querybuf))) == 1)
 		{
@@ -2680,7 +2698,7 @@ static void clientReply (
 	}
 	/**
          * Clear BREF_QUERY_ACTIVE flag and decrease waiter counter.
-         * This applies for queries  other than session commands.
+         * This applies for queries other than session commands.
          */
 	else if (BREF_IS_QUERY_ACTIVE(bref))
 	{
@@ -2704,7 +2722,7 @@ static void clientReply (
                 goto lock_failed;
         }
         /** There is one pending session command to be executed. */
-        if (sescmd_cursor_is_active(scur)) 
+        if (sescmd_cursor_is_active(scur))
         {
                 bool succp;
                 
@@ -2722,7 +2740,43 @@ static void clientReply (
 	else if (bref->bref_pending_cmd != NULL) /*< non-sescmd is waiting to be routed */
 	{
 		int ret;
+#if 1
+		GWBUF* single_stmt_buf;
 		
+		CHK_GWBUF(bref->bref_pending_cmd);
+		/** Pop the first buffer from pending buffer list */
+		single_stmt_buf = gwbuf_clone_portion(
+					bref->bref_pending_cmd, 
+					0, 
+					GWBUF_LENGTH(bref->bref_pending_cmd));
+		
+		bref->bref_pending_cmd = gwbuf_consume(
+						bref->bref_pending_cmd, 
+						GWBUF_LENGTH(bref->bref_pending_cmd));
+		CHK_GWBUF(single_stmt_buf);
+		
+		if ((ret = bref->bref_dcb->func.write(
+			bref->bref_dcb, 
+			gwbuf_clone(single_stmt_buf))) == 1)
+		{
+			ROUTER_INSTANCE* inst = (ROUTER_INSTANCE *)instance;
+			atomic_add(&inst->stats.n_queries, 1);
+			/**
+			 * Add one query response waiter to backend reference
+			 */
+			bref_set_state(bref, BREF_QUERY_ACTIVE);
+			bref_set_state(bref, BREF_WAITING_RESULT);
+		}
+		else
+		{
+			LOGIF(LE, (skygw_log_write_flush(
+				LOGFILE_ERROR,
+				"Error : Routing query \"%s\" failed.",
+				single_stmt_buf)));
+// 			ss_dassert(false);
+		}
+		gwbuf_free(single_stmt_buf);
+#else
 		CHK_GWBUF(bref->bref_pending_cmd);
 		
 		if ((ret = bref->bref_dcb->func.write(
@@ -2746,6 +2800,7 @@ static void clientReply (
 		}
 		gwbuf_free(bref->bref_pending_cmd);
 		bref->bref_pending_cmd = NULL;
+#endif
 	}
 	/** Unlock router session */
         rses_end_locked_router_action(router_cli_ses);
@@ -4101,8 +4156,30 @@ static bool route_session_write(
                                 
                 for (i=0; i<router_cli_ses->rses_nbackends; i++)
                 {
-                        DCB* dcb = backend_ref[i].bref_dcb;     
+			DCB* dcb = backend_ref[i].bref_dcb;     
+#if 1
+			backend_ref_t* bref = &backend_ref[i];
+			/** Add new statement to the end of pending command list */
+			bref->bref_pending_cmd = gwbuf_append(
+						bref->bref_pending_cmd, 
+						gwbuf_clone(querybuf));
 			
+			if (BREF_IS_WAITING_RESULT(bref))
+			{
+				rses_end_locked_router_action(router_cli_ses);
+				continue;
+			}
+			
+			/** reassign querybuf with the first statement on the list */
+			querybuf = gwbuf_clone_portion(
+					bref->bref_pending_cmd, 
+					0, 
+					GWBUF_LENGTH(bref->bref_pending_cmd));
+			bref->bref_pending_cmd = gwbuf_consume(
+							bref->bref_pending_cmd, 
+							GWBUF_LENGTH(bref->bref_pending_cmd));
+			
+#else			
 			if (LOG_IS_ENABLED(LOGFILE_TRACE))
 			{
 				LOGIF(LT, (skygw_log_write(
@@ -4114,7 +4191,7 @@ static bool route_session_write(
 					backend_ref[i].bref_backend->backend_server->port,
 					(i+1==router_cli_ses->rses_nbackends ? " <" : " "))));
 			}
-
+#endif
                         if (BREF_IS_IN_USE((&backend_ref[i])))
                         {
                                 rc = dcb->func.write(dcb, gwbuf_clone(querybuf));
@@ -4156,6 +4233,25 @@ static bool route_session_write(
         {
                 if (BREF_IS_IN_USE((&backend_ref[i])))
                 {
+#if 1
+			backend_ref_t* bref;
+			
+			bref = &backend_ref[i];
+			/** Add new statement to the end of pending command list */
+			bref->bref_pending_cmd = gwbuf_append(
+							bref->bref_pending_cmd, 
+							gwbuf_clone(querybuf));
+						
+			/** reassign querybuf with the first statement on the list */
+			querybuf = gwbuf_clone_portion(
+					bref->bref_pending_cmd, 
+					0, 
+					GWBUF_LENGTH(bref->bref_pending_cmd));
+			/** Remove the first buffer from the list */
+			bref->bref_pending_cmd = gwbuf_consume(
+							bref->bref_pending_cmd, 
+							GWBUF_LENGTH(bref->bref_pending_cmd));
+#endif
                         sescmd_cursor_t* scur;
                         
 			if (LOG_IS_ENABLED(LOGFILE_TRACE))
@@ -4169,15 +4265,39 @@ static bool route_session_write(
 					backend_ref[i].bref_backend->backend_server->port,
 					(i+1==router_cli_ses->rses_nbackends ? " <" : " "))));
 			}
-			
                         scur = backend_ref_get_sescmd_cursor(&backend_ref[i]);
                         
                         /** 
                          * Add one waiter to backend reference.
                          */
-                        bref_set_state(get_bref_from_dcb(router_cli_ses, 
-                                                         backend_ref[i].bref_dcb), 
-							BREF_WAITING_RESULT);
+#if 1
+			if (BREF_IS_WAITING_RESULT(bref) || sescmd_cursor_is_active(scur))
+			{
+				succp = true;
+				bref_set_state(bref, BREF_WAITING_RESULT);
+				
+				LOGIF(LT, (skygw_log_write(
+					LOGFILE_TRACE,
+					"Backend %s:%d already executing sescmd.",
+					bref->bref_backend->backend_server->name,
+					bref->bref_backend->backend_server->port)));
+			}
+			else
+			{
+				bref_set_state(bref, BREF_WAITING_RESULT);
+				succp = execute_sescmd_in_backend(&backend_ref[i]);
+				
+				if (!succp)
+				{
+					LOGIF(LE, (skygw_log_write_flush(
+						LOGFILE_ERROR,
+						"Error : Failed to execute session "
+						"command in %s:%d",
+						backend_ref[i].bref_backend->backend_server->name,
+						backend_ref[i].bref_backend->backend_server->port)));
+				}
+			}		
+#else
                         /** 
                          * Start execution if cursor is not already executing.
                          * Otherwise, cursor will execute pending commands
@@ -4207,6 +4327,7 @@ static bool route_session_write(
                                                 backend_ref[i].bref_backend->backend_server->port)));
                                 }
                         }
+#endif
                 }
                 else
 		{

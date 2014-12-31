@@ -149,6 +149,7 @@ typedef struct {
 	int		n_duped;	/* Number of duplicated queries */
 	int		n_rejected;	/* Number of rejected queries */
 	int		residual;	/* Any outstanding SQL text */
+	SPINLOCK        tee_lock;	/* Protect tee's routeQuery */
 } TEE_SESSION;
 
 static int packet_is_required(GWBUF *queue);
@@ -583,6 +584,8 @@ GWBUF		*clone = NULL;
 			clone = gwbuf_clone(queue);
 		}
 	}
+	/** Serialize routing to both sessions */
+	spinlock_acquire(&my_session->tee_lock);
 	/* Pass the query downstream */
 	rval = my_session->down.routeQuery(my_session->down.instance,
 						my_session->down.session, 
@@ -603,7 +606,7 @@ GWBUF		*clone = NULL;
 				LOGFILE_TRACE,
 			      "Closed tee filter session.")));
 			gwbuf_free(clone);
-		}		
+		}
 	}
 	else
 	{
@@ -616,6 +619,7 @@ GWBUF		*clone = NULL;
 		}
 		my_session->n_rejected++;
 	}
+	spinlock_release(&my_session->tee_lock);
 	return rval;
 }
 

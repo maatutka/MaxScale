@@ -336,7 +336,7 @@ GWBUF *rval = head;
 
         CHK_GWBUF(head);
 	GWBUF_CONSUME(head, length);
-    CHK_GWBUF(head);
+	CHK_GWBUF(head);
         
 	if (GWBUF_EMPTY(head))
 	{
