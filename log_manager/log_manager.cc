@@ -94,7 +94,9 @@ char* syslog_ident_str = NULL;
  */
 static int lmlock;
 static logmanager_t* lm;
-
+static bool flushall_flag;
+static bool flushall_started_flag;
+static bool flushall_done_flag;
 
 /** Writer thread structure */
 struct filewriter_st {
@@ -286,12 +288,14 @@ static char* add_slash(char* str);
 
 static bool check_file_and_path(
 	char* filename,
-	bool* writable);
+	bool* writable,
+	bool  do_log);
 
 static bool  file_is_symlink(char* filename);
 static int skygw_log_disable_raw(logfile_id_t id, bool emergency); /*< no locking */
 static int find_last_seqno(strpart_t* parts, int seqno, int seqnoidx);
-
+void flushall_logfiles(bool flush);
+bool thr_flushall_check();
 
 const char* get_suffix_default(void)
 {
@@ -441,17 +445,6 @@ static bool logmanager_init_nomutex(
 return_succp:
         if (err != 0) 
 	{
-		if (lm != NULL)
-		{
-			if (lm->lm_clientmes != NULL)
-			{
-				skygw_message_done(lm->lm_clientmes);
-			}
-			if (lm->lm_logmes != NULL)
-			{
-				skygw_message_done(lm->lm_logmes);
-			}
-		}
 		/** This releases memory of all created objects */
 		logmanager_done_nomutex();
 		fprintf(stderr, "*\n* Error : Initializing log manager failed.\n*\n");
@@ -462,23 +455,14 @@ return_succp:
 
 
 /** 
- * @node Initializes log managing routines in MariaDB Corporation MaxScale.
+ * Initializes log managing routines in MariaDB Corporation MaxScale.
  *
  * Parameters:
- * @param p_ctx - in, give
- *          pointer to memory location where logmanager stores private write
- * buffer.
+ * @param argc	number of arguments in argv array
  *
- * @param argc - in, use
- *          number of arguments in argv array
+ * @param argv	arguments array
  *
- * @param argv - in, use
- *          arguments array
- *
- * @return 
- *
- * 
- * @details (write detailed description here)
+ * @return true if succeed, otherwise false
  *
  */
 bool skygw_logmanager_init(
@@ -502,7 +486,12 @@ return_succp:
         return succp;
 }
 
-
+/**
+ * Release resources of log manager. 
+ * 
+ * Lock must have been acquired before calling
+ * this function.
+ */
 static void logmanager_done_nomutex(void)
 {
         int           i;
@@ -547,17 +536,7 @@ static void logmanager_done_nomutex(void)
 
 
 /** 
- * @node This function is provided for atexit() system function. 
- *
- * Parameters:
- * @param void - <usage>
- *          <description>
- *
- * @return void
- *
- * 
- * @details (write detailed description here)
- *
+ * This function is provided for atexit() system function. 
  */
 void skygw_logmanager_exit(void)
 {
@@ -565,20 +544,9 @@ void skygw_logmanager_exit(void)
 }
 
 /** 
- * @node End execution of log manager
+ * End execution of log manager
  *
- * Parameters:
- * @param p_ctx - in, take
- *           pointer to memory location including context pointer. Context will
- *           be freed in this function.
- *
- * @param logmanager - in, use
- *          pointer to logmanager.
- *
- * @return void
- *
- * 
- * @details Stops file writing thread, releases filewriter, and logfiles.
+ * Stops file writing thread, releases filewriter, and logfiles.
  *
  */
 void skygw_logmanager_done(void)
@@ -630,38 +598,25 @@ static logfile_t* logmanager_get_logfile(
 
 
 /** 
- * @node Finds write position from block buffer for log string and writes there.  
- *
+ * Finds write position from block buffer for log string and writes there.
+ * 
  * Parameters:
  *
- * @param id - in, use
- *          logfile object identifier
+ * @param id		logfile object identifier
+ * @param flush		indicates whether log string must be written to disk 
+ * 			immediately
+ * @param use_valist	does write involve formatting of the string and use of 
+ * 			valist argument
+ * @param spread_down	if true, log string is spread to all logs having 
+ * 			larger id.
+ * @param rotate	if set, closes currently open log file and opens a 
+ * 			new one
+ * @param str_len	length of formatted string
+ * @param str		string to be written to log 
+ * @param valist	variable-length argument list for formatting the string
  *
- * @param flush - in, use
- *          indicates whether log string must be written to disk immediately
- *
- * @param use_valist - in, use
- *          does write involve formatting of the string and use of valist argument
- *
- * @param spread_down - in, use
- *          if true, log string is spread to all logs having larger id.
+ * @return 0 if succeed, -1 otherwise
  * 
- * @param rotate	if set, closes currently open log file and opens a new one
- *
- * @param str_len - in, use
- *          length of formatted string
- *
- * @param str - in, use
- *          string to be written to log 
- *
- * @param valist - in, use
- *          variable-length argument list for formatting the string
- *
- * @return 
- *
- * 
- * @details (write detailed description here)
- *
  */
 static int logmanager_write_log(
         logfile_id_t  id,
@@ -722,17 +677,21 @@ static int logmanager_write_log(
 			logfile_rotate(lf); /*< wakes up file writer */ 
 		}
         }
-        else 
+        else
 	{
                 /** Length of string that will be written, limited by bufsize */
                 int safe_str_len; 
 		/** Length of session id */
 		int sesid_str_len;
 
-		/** 2 braces and 2 spaces */
+		/** 
+		 * 2 braces, 2 spaces and terminating char
+		 * If session id is stored to tls_log_info structure, allocate 
+		 * room for session id too.
+		 */
 		if (id == LOGFILE_TRACE && tls_log_info.li_sesid != 0)
 		{
-			sesid_str_len = 2+2+get_decimal_len(tls_log_info.li_sesid); 
+			sesid_str_len = 2+2+get_decimal_len(tls_log_info.li_sesid)+1; 
 		}
 		else
 		{
@@ -741,13 +700,13 @@ static int logmanager_write_log(
                 timestamp_len = get_timestamp_len();
                 
                 /** Find out how much can be safely written with current block size */
-		if (timestamp_len-1+sesid_str_len+str_len > lf->lf_buf_size)
+		if (timestamp_len-1+MAX(sesid_str_len-1,0)+str_len > lf->lf_buf_size)
 		{
 			safe_str_len = lf->lf_buf_size;
 		}
                 else
 		{
-			safe_str_len = timestamp_len-1+sesid_str_len+str_len;
+			safe_str_len = timestamp_len-1+MAX(sesid_str_len-1,0)+str_len;
 		}
                 /**
                  * Seek write position and register to block buffer.
@@ -792,7 +751,6 @@ static int logmanager_write_log(
 		  wp += strlen(wp);
 		}
 #endif
-
                 /**
                  * Write timestamp with at most <timestamp_len> characters
                  * to wp.
@@ -809,6 +767,7 @@ static int logmanager_write_log(
 				 sesid_str_len, 
 				 "[%lu]  ", 
 				 tls_log_info.li_sesid);
+			sesid_str_len -= 1; /*< don't calculate terminating char anymore */
 		}
                 /**
                  * Write next string to overwrite terminating null character
@@ -911,6 +870,12 @@ return_err:
         return err;
 }
 
+/**
+ * Register writer to a block buffer. When reference counter is non-zero the
+ * flusher thread doesn't write the block to disk.
+ * 
+ * @param bb	block buffer
+ */
 static void blockbuf_register(
         blockbuf_t* bb)
 {
@@ -919,7 +884,12 @@ static void blockbuf_register(
         atomic_add(&bb->bb_refcount, 1);
 }
 
-
+/**
+ * Unregister writer from block buffer. If the buffer got filled up and there
+ * are no other registered writers anymore, notify the flusher thread.
+ * 
+ * @param bb	block buffer
+ */
 static void blockbuf_unregister(
         blockbuf_t* bb)
 {
@@ -1099,7 +1069,7 @@ static char* blockbuf_get_writepos(
 
 					  simple_mutex_unlock(&bb->bb_mutex);
 					  simple_mutex_lock(&bb_list->mlist_mutex, true);
-					  
+					  node = bb_list->mlist_first;
 				  }
 			  else
 				  {
@@ -1544,7 +1514,7 @@ return_unregister:
 
 	logmanager_unregister();
 
-	return_err:
+return_err:
 
 	return err;
 }
@@ -1881,10 +1851,9 @@ static char* fname_conf_get_suffix(
  * 
  *
  * Parameters:
- * @param lm - <usage>
- *          <description>
+ * @param lm		Log manager pointer
  *
- * @return 
+ * @return succp	true if succeed, otherwise false. 
  *
  * 
  * @details If logfile is supposed to be located to shared memory
@@ -1904,6 +1873,7 @@ static bool logfiles_init(
         bool  store_shmem;
         bool  write_syslog;
 
+	/** Open syslog immediately. Print pid of loggind process. */
         if (syslog_id_str != NULL)
         {
                 openlog(syslog_ident_str, LOG_PID | LOG_NDELAY, LOG_USER);
@@ -2052,7 +2022,7 @@ static bool logfile_create(
 		 * If file exists but is different type, create fails and
 		 * new, increased sequence number is added to file name.
 		 */
-		if (check_file_and_path(lf->lf_full_file_name, &writable))
+		if (check_file_and_path(lf->lf_full_file_name, &writable, true))
 		{
 			/** Found similarly named file which isn't writable */
 			if (!writable || file_is_symlink(lf->lf_full_file_name))
@@ -2076,13 +2046,11 @@ static bool logfile_create(
 		
 		if (store_shmem)
 		{
-			if (check_file_and_path(lf->lf_full_file_name, &writable))
+			if (check_file_and_path(lf->lf_full_link_name, &writable, true))
 			{
-				/** Found similarly named file which isn't writable */
-				if (!writable || 
-					file_is_symlink(lf->lf_full_file_name))
+				/** Found similarly named link which isn't writable */
+				if (!writable)
 				{
-					unlink(lf->lf_full_file_name);
 					nameconflicts = true;
 				}
 			}
@@ -2213,7 +2181,6 @@ return_succp:
  *
  * @return Pointer to filename, of NULL if failed.
  *
- * 
  */
 static char* form_full_file_name(
         strpart_t* parts,
@@ -2230,9 +2197,21 @@ static char* form_full_file_name(
 		
         if (lf->lf_name_seqno != -1)
         {
-		lf->lf_name_seqno = find_last_seqno(parts, 
-						    lf->lf_name_seqno, 
-						    seqnoidx);	
+		int   file_sn;
+		int   link_sn = 0;
+		char* tmp = parts[0].sp_string;
+		
+		file_sn = find_last_seqno(parts, lf->lf_name_seqno, seqnoidx);
+		
+		if (lf->lf_linkpath != NULL)
+		{
+			tmp = parts[0].sp_string;
+			parts[0].sp_string = lf->lf_linkpath;
+			link_sn = find_last_seqno(parts, lf->lf_name_seqno, seqnoidx);
+			parts[0].sp_string = tmp;
+		}
+		lf->lf_name_seqno = MAX(file_sn, link_sn);
+		
 		seqno = lf->lf_name_seqno;		
                 s = UINTLEN(seqno);
                 seqnostr = (char *)malloc((int)s+1);
@@ -2353,7 +2332,8 @@ static char* add_slash(
  */
 static bool check_file_and_path(
 	char* filename,
-	bool* writable)
+	bool* writable,
+	bool  do_log)
 {
 	int  fd;
 	bool exists;
@@ -2381,11 +2361,23 @@ static bool check_file_and_path(
 				
 				if (fd == -1)
 				{
-					fprintf(stderr,
-						"*\n* Error : Can't access %s due "
-						"to %s.\n",
-						filename,
-						strerror(errno));
+					if (do_log && file_is_symlink(filename))
+					{
+						fprintf(stderr,
+							"*\n* Error : Can't access "
+							"file pointed to by %s due "
+							"to %s.\n",
+							filename,
+							strerror(errno));
+					}
+					else if (do_log)
+					{
+						fprintf(stderr,
+							"*\n* Error : Can't access %s due "
+							"to %s.\n",
+							filename,
+							strerror(errno));
+					}
 					if (writable)
 					{
 						*writable = false;
@@ -2402,11 +2394,24 @@ static bool check_file_and_path(
 						}
 						else
 						{
-							fprintf(stderr,
-								"*\n* Error : Can't write to "
-								"%s due to %s.\n", 
-								filename,
-								strerror(errno));
+							if (do_log && 
+								file_is_symlink(filename))
+							{
+								fprintf(stderr,
+									"*\n* Error : Can't write to "
+									"file pointed to by %s due to "
+									"%s.\n", 
+									filename,
+									strerror(errno));
+							}
+							else if (do_log)
+							{
+								fprintf(stderr,
+									"*\n* Error : Can't write to "
+									"%s due to %s.\n", 
+									filename,
+									strerror(errno));
+							}
 							*writable = false;
 						}
 					}
@@ -2416,10 +2421,21 @@ static bool check_file_and_path(
 			}
 			else
 			{
-				fprintf(stderr,
-					"*\n* Error : Can't access %s due to %s.\n",
-					filename,
-					strerror(errno));
+				if (do_log && file_is_symlink(filename))
+				{
+					fprintf(stderr,
+						"*\n* Error : Can't access the file "
+						"pointed to by %s due to %s.\n",
+						filename,
+						strerror(errno));
+				}
+				else if (do_log)
+				{
+					fprintf(stderr,
+						"*\n* Error : Can't access %s due to %s.\n",
+						filename,
+						strerror(errno));
+				}					
 				exists = false;
 				
 				if (writable)
@@ -2470,21 +2486,13 @@ static bool file_is_symlink(
  * link name. Create block buffer for logfile.
  *
  * Parameters:
- * @param logfile - <usage>
- *          <description>
- *
- * @param logfile_id - <usage>
- *          <description>
- *
- * @param logmanager - <usage>
- *          <description>
- *
- * @param store_shmem - <usage>
- *          <description>
- *
+ * @param logfile	log file
+ * @param logfile_id	identifier for log file
+ * @param logmanager	log manager pointer
+ * @param store_shmem	flag to indicate whether log is physically written to shmem
+ * @param write_syslog	flag to indicate whether log is also written to syslog
+ * 
  * @return true if succeed, false otherwise
- *
- *
  */
 static bool logfile_init(
         logfile_t*     logfile,
@@ -2571,6 +2579,7 @@ static bool logfile_init(
                 logfile_free_memory(logfile);
                 goto return_with_succp;
         }
+
 #if defined(SS_DEBUG)
         if (store_shmem)
 	{
@@ -2801,13 +2810,15 @@ static void* thr_filewriter_fun(
         int           i;
         blockbuf_state_t          flush_blockbuf;   /**< flush single block buffer. */
         bool          flush_logfile;    /**< flush logfile */
-        bool          flushall_logfiles;/**< flush all logfiles */
+		bool		  do_flushall = false;
         bool          rotate_logfile;   /*< close current and open new file */
         size_t        vn1;
         size_t        vn2;
 
         thr = (skygw_thread_t *)data;
         fwr = (filewriter_t *)skygw_thread_get_data(thr);
+		flushall_logfiles(false);
+
         CHK_FILEWRITER(fwr);
         ss_debug(skygw_thread_set_state(thr, THR_RUNNING));
 
@@ -2820,16 +2831,21 @@ static void* thr_filewriter_fun(
                  * Reset message to avoid redundant calls.
                  */
                 skygw_message_wait(fwr->fwr_logmes);
-
-                flushall_logfiles = skygw_thread_must_exit(thr);
+				if(skygw_thread_must_exit(thr)){
+				    flushall_logfiles(true);
+				}
             
                 /** Process all logfiles which have buffered writes. */
-                for (i=LOGFILE_FIRST; i<=LOGFILE_LAST; i <<= 1) 
+                for (i=LOGFILE_FIRST; i<=LOGFILE_LAST; i <<= 1)
 		{
                 retry_flush_on_exit:
                         /**
                          * Get file pointer of current logfile.
                          */
+
+
+
+						do_flushall = thr_flushall_check();
                         file = fwr->fwr_file[i];
                         lf = &lm->lm_logfile[(logfile_id_t)i];
 
@@ -2900,7 +2916,7 @@ static void* thr_filewriter_fun(
                                 if (bb->bb_buf_used != 0 &&
                                     (flush_blockbuf == BB_FULL ||
                                      flush_logfile ||
-                                     flushall_logfiles))
+                                     do_flushall))
                                 {
                                         /**
                                          * buffer is at least half-full
@@ -2919,7 +2935,7 @@ static void* thr_filewriter_fun(
 						(void *)bb->bb_buf,
 						bb->bb_buf_used,
 						(flush_logfile || 
-							flushall_logfiles));
+						    do_flushall));
 					if (err)
 					{
 						fprintf(stderr,
@@ -2966,13 +2982,28 @@ static void* thr_filewriter_fun(
                          * Loop is restarted to ensure that all logfiles are
                          * flushed.
                          */
-                        if (!flushall_logfiles && skygw_thread_must_exit(thr))
+
+						if(flushall_started_flag){
+							flushall_started_flag = false;
+							flushall_done_flag = true;
+							i = LOGFILE_FIRST;
+							    goto retry_flush_on_exit;
+						}
+
+                        if (!thr_flushall_check() && skygw_thread_must_exit(thr))
                         {
-                                flushall_logfiles = true;
+							    flushall_logfiles(true);
                                 i = LOGFILE_FIRST;
                                 goto retry_flush_on_exit;
                         }
-                } /* for */
+                }/* for */
+				
+				if(flushall_done_flag){
+					flushall_done_flag = false;
+					flushall_logfiles(false);
+					skygw_message_send(fwr->fwr_clientmes);
+				}
+				
         } /* while (!skygw_thread_must_exit) */
         
         ss_debug(skygw_thread_set_state(thr, THR_STOPPED));
@@ -3048,11 +3079,11 @@ static int find_last_seqno(
 		
 		for (i=0, p=parts; p->sp_string != NULL; i++, p=p->sp_next)
 		{
-			if (snstr != NULL && i == seqnoidx && strnlen(snstr,NAME_MAX) < NAME_MAX)
+			if (snstr != NULL && i == seqnoidx)
 			{
-				strcat(filename, snstr); /*< add sequence number */
+				strncat(filename, snstr, NAME_MAX - 1); /*< add sequence number */
 			}
-			strcat(filename, p->sp_string);
+			strncat(filename, p->sp_string, NAME_MAX - 1);
 			
 			if (p->sp_next == NULL)
 			{
@@ -3060,7 +3091,7 @@ static int find_last_seqno(
 			}
 		}
 		
-		if (check_file_and_path(filename, NULL))
+		if (check_file_and_path(filename, NULL, false))
 		{
 			seqno++;
 		}
@@ -3072,4 +3103,34 @@ static int find_last_seqno(
 	free(snstr);
 
 	return seqno;
+}
+
+bool thr_flushall_check()
+{
+	bool rval = false;
+	simple_mutex_lock(&lm->lm_mutex,true);	
+	rval = flushall_flag;
+	if(rval && !flushall_started_flag && !flushall_done_flag){
+		flushall_started_flag = true;
+	}
+	simple_mutex_unlock(&lm->lm_mutex);
+	return rval;
+}
+
+void flushall_logfiles(bool flush)
+{
+	simple_mutex_lock(&lm->lm_mutex,true);	
+	flushall_flag = flush;
+	simple_mutex_unlock(&lm->lm_mutex);
+}
+
+/**
+ * Flush all log files synchronously
+ */
+void skygw_log_sync_all(void)
+{
+	skygw_log_write(LOGFILE_TRACE,"Starting log flushing to disk.");
+	flushall_logfiles(true);
+	skygw_message_send(lm->lm_logmes);
+	skygw_message_wait(lm->lm_clientmes);
 }

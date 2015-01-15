@@ -341,19 +341,26 @@ poll_remove_dcb(DCB *dcb)
         /*<
          * Set state to NOPOLLING and remove dcb from poll set.
          */
-        if (dcb_set_state(dcb, new_state, &old_state)) {
-                rc = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dcb->fd, &ev);
+        if (dcb_set_state(dcb, new_state, &old_state)) 
+	{
+		/**
+		 * Only positive fds can be removed from epoll set.
+		 */		 
+		if (dcb->fd > 0) 
+		{
+			rc = epoll_ctl(epoll_fd, EPOLL_CTL_DEL, dcb->fd, &ev);
 
-                if (rc != 0) {
-                        int eno = errno;
-                        errno = 0;
-                        LOGIF(LE, (skygw_log_write_flush(
-                                LOGFILE_ERROR,
-                                "Error : epoll_ctl failed due %d, %s.",
-                                eno,
-                                strerror(eno))));
-                }
-                ss_dassert(rc == 0); /*< trap in debug */
+			if (rc != 0) {
+				int eno = errno;
+				errno = 0;
+				LOGIF(LE, (skygw_log_write_flush(
+					LOGFILE_ERROR,
+					"Error : epoll_ctl failed due %d, %s.",
+					eno,
+					strerror(eno))));
+			}
+			ss_dassert(rc == 0); /*< trap in debug */
+		}
         }
         /*<
          * This call was redundant, but the end result is correct.
@@ -667,6 +674,14 @@ poll_set_maxwait(unsigned int maxwait)
  * to process the DCB. If there are pending events the DCB will be moved to the
  * back of the queue so that other DCB's will have a share of the threads to
  * execute events for them.
+ * 
+ * Including session id to log entries depends on this function. Assumption is
+ * that when maxscale thread starts processing of an event it processes one
+ * and only one session until it returns from this function. Session id is
+ * read to thread's local storage in macro LOGIF_MAYBE(...) and reset back
+ * to zero just before returning in LOGIF(...) macro.
+ * Thread local storage (tls_log_info_t) follows thread and is accessed every
+ * time log is written to particular log.
  *
  * @param thread_id	The thread ID of the calling thread
  * @return 		0 if no DCB's have been processed
@@ -790,7 +805,7 @@ unsigned long	qtime;
 			simple_mutex_unlock(&dcb->dcb_write_lock);
 #else
 			atomic_add(&pollStats.n_write, 1);
-			
+			/** Read session id to thread's local storage */
 			LOGIF_MAYBE(LT, (dcb_get_ses_log_info(
 						dcb, 
 						&tls_log_info.li_sesid, 
@@ -844,6 +859,7 @@ unsigned long	qtime;
 				dcb,
 				dcb->fd)));
 			atomic_add(&pollStats.n_read, 1);
+			/** Read session id to thread's local storage */
 			LOGIF_MAYBE(LT, (dcb_get_ses_log_info(
 				dcb, 
 				&tls_log_info.li_sesid, 
@@ -883,6 +899,7 @@ unsigned long	qtime;
 				strerror(eno))));
 		}
 		atomic_add(&pollStats.n_error, 1);
+		/** Read session id to thread's local storage */
 		LOGIF_MAYBE(LT, (dcb_get_ses_log_info(
 			dcb, 
 			&tls_log_info.li_sesid, 
@@ -911,6 +928,7 @@ unsigned long	qtime;
 		{
 			dcb->flags |= DCBF_HUNG;
 			spinlock_release(&dcb->dcb_initlock);
+			/** Read session id to thread's local storage */
 			LOGIF_MAYBE(LT, (dcb_get_ses_log_info(
 				dcb, 
 				&tls_log_info.li_sesid, 
@@ -943,6 +961,7 @@ unsigned long	qtime;
 		{
 			dcb->flags |= DCBF_HUNG;
 			spinlock_release(&dcb->dcb_initlock);
+			/** Read session id to thread's local storage */
 			LOGIF_MAYBE(LT, (dcb_get_ses_log_info(
 				dcb, 
 				&tls_log_info.li_sesid, 
@@ -1008,6 +1027,7 @@ unsigned long	qtime;
 		}
 	}
 	dcb->evq.processing = 0;
+	/** Reset session id from thread's local storage */
 	LOGIF(LT, tls_log_info.li_sesid = 0);
 	spinlock_release(&pollqlock);
 
@@ -1322,7 +1342,6 @@ void poll_add_epollin_event_to_dcb(
 }
 
 
-
 static void poll_add_event_to_dcb(
 	DCB*       dcb,
 	GWBUF*     buf,
@@ -1338,6 +1357,10 @@ static void poll_add_event_to_dcb(
 	/** Set event to DCB */
 	if (DCB_POLL_BUSY(dcb))
 	{
+		if (dcb->evq.pending_events == 0)
+		{
+			pollStats.evq_pending++;
+		}
 		dcb->evq.pending_events |= ev;
 	}
 	else
@@ -1358,6 +1381,8 @@ static void poll_add_event_to_dcb(
 			dcb->evq.next = dcb;
 		}
 		pollStats.evq_length++;
+		pollStats.evq_pending++;
+		
 		if (pollStats.evq_length > pollStats.evq_max)
 		{
 			pollStats.evq_max = pollStats.evq_length;

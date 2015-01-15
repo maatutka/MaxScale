@@ -59,6 +59,8 @@
 #include <mysql_client_server_protocol.h>
 
 extern int lm_enabled_logfiles_bitmask;
+extern size_t         log_ses_count[];
+extern __thread log_info_t tls_log_info;
 
 static char *version_str = "V1.0.6";
 
@@ -186,6 +188,8 @@ int		i;
 	inst->long_burst = DEF_LONG_BURST;
 	inst->burst_size = DEF_BURST_SIZE;
 	inst->retry_backoff = 1;
+	inst->binlogdir = NULL;
+	inst->heartbeat = 300;	// Default is every 5 minutes
 
 	/*
 	 * We only support one server behind this router, since the server is
@@ -197,7 +201,7 @@ int		i;
 	 * which of these servers is currently the master and replicate from
 	 * that server.
 	 */
-	if (service->databases == NULL || service->databases->nextdb != NULL)
+	if (service->dbref == NULL || service->dbref->next != NULL)
 	{
 		LOGIF(LE, (skygw_log_write(
 			LOGFILE_ERROR,
@@ -306,6 +310,14 @@ int		i;
 					inst->burst_size = size;
 					
 				}
+				else if (strcmp(options[i], "heartbeat") == 0)
+				{
+					inst->heartbeat = atoi(value);
+				}
+				else if (strcmp(options[i], "binlogdir") == 0)
+				{
+					inst->binlogdir = strdup(value);
+				}
 				else
 				{
 					LOGIF(LE, (skygw_log_write(
@@ -320,16 +332,6 @@ int		i;
 			inst->fileroot = strdup(BINLOG_NAME_ROOT);
 	}
 
-	/*
-	 * We have completed the creation of the instance data, so now
-	 * insert this router instance into the linked list of routers
-	 * that have been created with this module.
-	 */
-	spinlock_acquire(&instlock);
-	inst->next = instances;
-	instances = inst;
-	spinlock_release(&instlock);
-
 	inst->active_logs = 0;
 	inst->reconnect_pending = 0;
 	inst->handling_threads = 0;
@@ -341,11 +343,30 @@ int		i;
 	/*
 	 * Initialise the binlog file and position
 	 */
-	blr_file_init(inst);
+	if (blr_file_init(inst) == 0)
+	{
+		LOGIF(LE, (skygw_log_write(
+			LOGFILE_ERROR,
+			"%s: Service not started due to lack of binlog directory.",
+				service->name)));
+		free(inst);
+		return NULL;
+	}
 	LOGIF(LT, (skygw_log_write(
 			LOGFILE_TRACE,
 			"Binlog router: current binlog file is: %s, current position %u\n",
 						inst->binlog_name, inst->binlog_position)));
+
+
+	/*
+	 * We have completed the creation of the instance data, so now
+	 * insert this router instance into the linked list of routers
+	 * that have been created with this module.
+	 */
+	spinlock_acquire(&instlock);
+	inst->next = instances;
+	instances = inst;
+	spinlock_release(&instlock);
 
 	/*
 	 * Initialise the binlog cache for this router instance
@@ -411,11 +432,14 @@ ROUTER_SLAVE		*slave;
 	slave->cstate = 0;
 	slave->pthread = 0;
 	slave->overrun = 0;
+	slave->uuid = NULL;
+	slave->hostname = NULL;
         spinlock_init(&slave->catch_lock);
 	slave->dcb = session->client;
 	slave->router = inst;
 	slave->file = NULL;
 	strcpy(slave->binlogfile, "unassigned");
+	slave->connect_time = time(0);
 
 	/**
          * Add this session to the list of active sessions.
@@ -509,13 +533,17 @@ ROUTER_SLAVE	 *slave = (ROUTER_SLAVE *)router_session;
 	{
 		/*
 		 * We must be closing the master session.
-		 *
-		 * TODO: Handle closure of master session
 		 */
+		LOGIF(LM, (skygw_log_write_flush(
+			LOGFILE_MESSAGE,
+			"%s: Master %s disconnected after %ld seconds. "
+			"%d events read,",
+			router->service->name, router->master->remote,
+			time(0) - router->connect_time, router->stats.n_binlogs_ses)));
         	LOGIF(LE, (skygw_log_write_flush(
 			LOGFILE_ERROR,
 			"Binlog router close session with master server %s",
-			router->service->databases->unique_name)));
+			router->service->dbref->server->unique_name)));
 		blr_master_reconnect(router);
 		return;
 	}
@@ -528,6 +556,15 @@ ROUTER_SLAVE	 *slave = (ROUTER_SLAVE *)router_session;
         {
 		/* decrease server registered slaves counter */
 		atomic_add(&router->stats.n_registered, -1);
+
+		LOGIF(LM, (skygw_log_write_flush(
+			LOGFILE_MESSAGE,
+			"%s: Slave %s, server id %d, disconnected after %ld seconds. "
+			"%d events sent, %lu bytes.",
+			router->service->name, slave->dcb->remote,
+			slave->serverid,
+			time(0) - slave->connect_time, slave->stats.n_events,
+			slave->stats.n_bytes)));
 
 		/*
 		 * Mark the slave as unregistered to prevent the forwarding
@@ -641,25 +678,29 @@ struct tm	tm;
 	min5 /= 5.0;
 	
 
-	dcb_printf(dcb, "\tMaster connection DCB:  		%p\n",
+	dcb_printf(dcb, "\tMaster connection DCB:  			%p\n",
 			router_inst->master);
-	dcb_printf(dcb, "\tMaster connection state:		%s\n",
+	dcb_printf(dcb, "\tMaster connection state:			%s\n",
 			blrm_states[router_inst->master_state]);
 
 	localtime_r(&router_inst->stats.lastReply, &tm);
 	asctime_r(&tm, buf);
 	
-	dcb_printf(dcb, "\tNumber of master connects:	  	%d\n",
+	dcb_printf(dcb, "\tBinlog directory:				%s\n",
+		   router_inst->binlogdir);
+	dcb_printf(dcb, "\tNumber of master connects:	  		%d\n",
                    router_inst->stats.n_masterstarts);
-	dcb_printf(dcb, "\tNumber of delayed reconnects:      	%d\n",
+	dcb_printf(dcb, "\tNumber of delayed reconnects:      		%d\n",
                    router_inst->stats.n_delayedreconnects);
-	dcb_printf(dcb, "\tCurrent binlog file:		  	%s\n",
+	dcb_printf(dcb, "\tCurrent binlog file:		  		%s\n",
                    router_inst->binlog_name);
-	dcb_printf(dcb, "\tCurrent binlog position:	  	%u\n",
+	dcb_printf(dcb, "\tCurrent binlog position:	  		%u\n",
                    router_inst->binlog_position);
-	dcb_printf(dcb, "\tNumber of slave servers:	   	%u\n",
+	dcb_printf(dcb, "\tNumber of slave servers:	   		%u\n",
                    router_inst->stats.n_slaves);
-	dcb_printf(dcb, "\tNumber of binlog events received:  	%u\n",
+	dcb_printf(dcb, "\tNo. of binlog events received this session:	%u\n",
+                   router_inst->stats.n_binlogs_ses);
+	dcb_printf(dcb, "\tTotal no. of binlog events received:        	%u\n",
                    router_inst->stats.n_binlogs);
 	minno = router_inst->stats.minno - 1;
 	if (minno == -1)
@@ -668,28 +709,31 @@ struct tm	tm;
 	dcb_printf(dcb, "\tCurrent        5        10       15       30 Min Avg\n");
 	dcb_printf(dcb, "\t %6d  %8.1f %8.1f %8.1f %8.1f\n",
 		   router_inst->stats.minavgs[minno], min5, min10, min15, min30);
-	dcb_printf(dcb, "\tNumber of fake binlog events:      	%u\n",
+	dcb_printf(dcb, "\tNumber of fake binlog events:      		%u\n",
                    router_inst->stats.n_fakeevents);
-	dcb_printf(dcb, "\tNumber of artificial binlog events: 	%u\n",
+	dcb_printf(dcb, "\tNumber of artificial binlog events: 		%u\n",
                    router_inst->stats.n_artificial);
-	dcb_printf(dcb, "\tNumber of binlog events in error:  	%u\n",
+	dcb_printf(dcb, "\tNumber of binlog events in error:  		%u\n",
                    router_inst->stats.n_binlog_errors);
-	dcb_printf(dcb, "\tNumber of binlog rotate events:  	%u\n",
+	dcb_printf(dcb, "\tNumber of binlog rotate events:  		%u\n",
                    router_inst->stats.n_rotates);
-	dcb_printf(dcb, "\tNumber of heartbeat events:     	%u\n",
+	dcb_printf(dcb, "\tNumber of heartbeat events:     		%u\n",
                    router_inst->stats.n_heartbeats);
-	dcb_printf(dcb, "\tNumber of packets received:		%u\n",
+	dcb_printf(dcb, "\tNumber of packets received:			%u\n",
 		   router_inst->stats.n_reads);
-	dcb_printf(dcb, "\tNumber of residual data packets:	%u\n",
+	dcb_printf(dcb, "\tNumber of residual data packets:		%u\n",
 		   router_inst->stats.n_residuals);
-	dcb_printf(dcb, "\tAverage events per packet		%.1f\n",
+	dcb_printf(dcb, "\tAverage events per packet			%.1f\n",
 		   (double)router_inst->stats.n_binlogs / router_inst->stats.n_reads);
-	dcb_printf(dcb, "\tLast event from master at:  		%s",
+	dcb_printf(dcb, "\tLast event from master at:  			%s",
 				buf);
 	dcb_printf(dcb, "\t					(%d seconds ago)\n",
 			time(0) - router_inst->stats.lastReply);
-	dcb_printf(dcb, "\tLast event from master:  		0x%x\n",
-			router_inst->lastEventReceived);
+	dcb_printf(dcb, "\tLast event from master:  			0x%x (%s)\n",
+			router_inst->lastEventReceived,
+			(router_inst->lastEventReceived >= 0 && 
+			router_inst->lastEventReceived < 0x24) ?
+			event_names[router_inst->lastEventReceived] : "unknown");
 	if (router_inst->active_logs)
 		dcb_printf(dcb, "\tRouter processing binlog records\n");
 	if (router_inst->reconnect_pending)
@@ -697,7 +741,7 @@ struct tm	tm;
 	dcb_printf(dcb, "\tEvents received:\n");
 	for (i = 0; i < 0x24; i++)
 	{
-		dcb_printf(dcb, "\t\t%-38s:  %u\n", event_names[i], router_inst->stats.events[i]);
+		dcb_printf(dcb, "\t\t%-38s   %u\n", event_names[i], router_inst->stats.events[i]);
 	}
 
 #if SPINLOCK_PROFILE
@@ -739,19 +783,46 @@ struct tm	tm;
 			min15 /= 15.0;
 			min10 /= 10.0;
 			min5 /= 5.0;
-			dcb_printf(dcb, "\t\tServer-id:			%d\n", session->serverid);
+			dcb_printf(dcb,
+				"\t\tServer-id:					%d\n",
+						 session->serverid);
 			if (session->hostname)
-				dcb_printf(dcb, "\t\tHostname:			%s\n", session->hostname);
-			dcb_printf(dcb, "\t\tSlave DCB:			%p\n", session->dcb);
-			dcb_printf(dcb, "\t\tNext Sequence No:		%d\n", session->seqno);
-			dcb_printf(dcb, "\t\tState:    			%s\n", blrs_states[session->state]);
-			dcb_printf(dcb, "\t\tBinlog file:			%s\n", session->binlogfile);
-			dcb_printf(dcb, "\t\tBinlog position:		%u\n", session->binlog_pos);
+				dcb_printf(dcb, "\t\tHostname:					%s\n", session->hostname);
+			if (session->uuid)
+				dcb_printf(dcb, "\t\tSlave UUID:					%s\n", session->uuid);
+			dcb_printf(dcb,
+				"\t\tSlave:						%s\n",
+						 session->dcb->remote);
+			dcb_printf(dcb,
+				"\t\tSlave DCB:					%p\n",
+						 session->dcb);
+			dcb_printf(dcb,
+				"\t\tNext Sequence No:				%d\n",
+						 session->seqno);
+			dcb_printf(dcb,
+				"\t\tState:    					%s\n",
+						 blrs_states[session->state]);
+			dcb_printf(dcb,
+				"\t\tBinlog file:					%s\n",
+						session->binlogfile);
+			dcb_printf(dcb,
+				"\t\tBinlog position:				%u\n",
+						session->binlog_pos);
 			if (session->nocrc)
-				dcb_printf(dcb, "\t\tMaster Binlog CRC:		None\n");
-			dcb_printf(dcb, "\t\tNo. requests:   		%u\n", session->stats.n_requests);
-			dcb_printf(dcb, "\t\tNo. events sent:		%u\n", session->stats.n_events);
-			dcb_printf(dcb, "\t\tNo. bursts sent:		%u\n", session->stats.n_bursts);
+				dcb_printf(dcb,
+					"\t\tMaster Binlog CRC:				None\n");
+			dcb_printf(dcb,
+				"\t\tNo. requests:   				%u\n",
+						session->stats.n_requests);
+			dcb_printf(dcb,
+					"\t\tNo. events sent:				%u\n",
+						session->stats.n_events);
+			dcb_printf(dcb,
+					"\t\tNo. bursts sent:				%u\n",
+						session->stats.n_bursts);
+			dcb_printf(dcb,
+					"\t\tNo. transitions to follow mode:			%u\n",
+						session->stats.n_bursts);
 			minno = session->stats.minno - 1;
 			if (minno == -1)
 				minno = 30;
@@ -760,15 +831,18 @@ struct tm	tm;
 			dcb_printf(dcb, "\t\t %6d  %8.1f %8.1f %8.1f %8.1f\n",
 		   		session->stats.minavgs[minno], min5, min10,
 						min15, min30);
-			dcb_printf(dcb, "\t\tNo. flow control:		%u\n", session->stats.n_flows);
-			dcb_printf(dcb, "\t\tNo. up to date:			%u\n", session->stats.n_upd);
-			dcb_printf(dcb, "\t\tNo. of drained cbs 		%u\n", session->stats.n_dcb);
-			dcb_printf(dcb, "\t\tNo. of low water cbs N/A	%u\n", session->stats.n_cbna);
-			dcb_printf(dcb, "\t\tNo. of failed reads		%u\n", session->stats.n_failed_read);
-			dcb_printf(dcb, "\t\tNo. of nested distribute events	%u\n", session->stats.n_overrun);
-			dcb_printf(dcb, "\t\tNo. of distribute action 1	%u\n", session->stats.n_actions[0]);
-			dcb_printf(dcb, "\t\tNo. of distribute action 2	%u\n", session->stats.n_actions[1]);
-			dcb_printf(dcb, "\t\tNo. of distribute action 3	%u\n", session->stats.n_actions[2]);
+			dcb_printf(dcb, "\t\tNo. flow control:				%u\n", session->stats.n_flows);
+			dcb_printf(dcb, "\t\tNo. up to date:					%u\n", session->stats.n_upd);
+			dcb_printf(dcb, "\t\tNo. of drained cbs 				%u\n", session->stats.n_dcb);
+			dcb_printf(dcb, "\t\tNo. of failed reads				%u\n", session->stats.n_failed_read);
+
+#if DETAILED_DIAG
+			dcb_printf(dcb, "\t\tNo. of nested distribute events			%u\n", session->stats.n_overrun);
+			dcb_printf(dcb, "\t\tNo. of distribute action 1			%u\n", session->stats.n_actions[0]);
+			dcb_printf(dcb, "\t\tNo. of distribute action 2			%u\n", session->stats.n_actions[1]);
+			dcb_printf(dcb, "\t\tNo. of distribute action 3			%u\n", session->stats.n_actions[2]);
+#endif
+
 			if ((session->cstate & CS_UPTODATE) == 0)
 			{
 				dcb_printf(dcb, "\t\tSlave is in catchup mode. %s%s\n", 
@@ -793,7 +867,7 @@ struct tm	tm;
 			dcb_printf(dcb, "\tSpinlock statistics (rses_lock):\n");
 			spinlock_stats(&session->rses_lock, spin_reporter, dcb);
 #endif
-			dcb_printf(dcb, "\n");
+			dcb_printf(dcb, "\t\t--------------------\n\n");
 			session = session->next;
 		}
 		spinlock_release(&router_inst->lock);
@@ -822,6 +896,24 @@ ROUTER_INSTANCE	*router = (ROUTER_INSTANCE *)instance;
 	router->stats.lastReply = time(0);
 }
 
+static char *
+extract_message(GWBUF *errpkt)
+{
+char	*rval;
+int	len;
+
+	len = EXTRACT24(errpkt->start);
+	if ((rval = (char *)malloc(len)) == NULL)
+		return NULL;
+	memcpy(rval, (char *)(errpkt->start) + 7, 6);
+	rval[6] = ' ';
+	memcpy(&rval[7], (char *)(errpkt->start) + 13, len - 8);
+	rval[len-2] = 0;
+	return rval;
+}
+
+
+
 /**
  * Error Reply routine
  *
@@ -841,10 +933,10 @@ errorReply(ROUTER *instance, void *router_session, GWBUF *message, DCB *backend_
 {
 ROUTER_INSTANCE	*router = (ROUTER_INSTANCE *)instance;
 int		error, len;
-char		msg[85];
+char		msg[85], *errmsg;
 
 	len = sizeof(error);
-	if (getsockopt(router->master->fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0)
+	if (router->master && getsockopt(router->master->fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error != 0)
 	{
 		strerror_r(error, msg, 80);
 		strcat(msg, " ");
@@ -852,10 +944,21 @@ char		msg[85];
 	else
 		strcpy(msg, "");
 
+	errmsg = extract_message(message);
        	LOGIF(LE, (skygw_log_write_flush(
-		LOGFILE_ERROR, "Master connection '%s', %sattempting reconnect to master",
-			message, msg)));
+		LOGFILE_ERROR, "%s: Master connection error '%s' in state '%s', "
+		"%sattempting reconnect to master",
+			router->service->name, errmsg,
+			blrm_states[router->master_state], msg)));
+	if (errmsg)
+		free(errmsg);
 	*succp = true;
+	LOGIF(LM, (skygw_log_write_flush(
+		LOGFILE_MESSAGE,
+		"%s: Master %s disconnected after %ld seconds. "
+		"%d events read.",
+		router->service->name, router->master->remote,
+		time(0) - router->connect_time, router->stats.n_binlogs_ses)));
 	blr_master_reconnect(router);
 }
 
@@ -943,4 +1046,145 @@ ROUTER_SLAVE	*slave;
 		slave = slave->next;
 	}
 	spinlock_release(&router->lock);
+}
+
+/**
+ * Return some basic statistics from the router in response to a COM_STATISTICS
+ * request.
+ *
+ * @param router	The router instance
+ * @param slave		The "slave" connection that requested the statistics
+ * @param queue		The statistics request
+ *
+ * @return non-zero on sucessful send
+ */
+int
+blr_statistics(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
+{
+char	result[1000], *ptr;
+GWBUF	*ret;
+int	len;
+
+	snprintf(result, 1000,
+		"Uptime: %u  Threads: %u  Events: %u  Slaves: %u  Master State: %s",
+			time(0) - router->connect_time,
+			config_threadcount(),
+			router->stats.n_binlogs_ses,
+			router->stats.n_slaves,
+			blrm_states[router->master_state]);
+	if ((ret = gwbuf_alloc(4 + strlen(result))) == NULL)
+		return 0;
+	len = strlen(result);
+	ptr = GWBUF_DATA(ret);
+	*ptr++ = len & 0xff;
+	*ptr++ = (len & 0xff00) >> 8;
+	*ptr++ = (len & 0xff0000) >> 16;
+	*ptr++ = 1;
+	strncpy(ptr, result, len);
+
+	return slave->dcb->func.write(slave->dcb, ret);
+}
+
+int
+blr_ping(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, GWBUF *queue)
+{
+char	*ptr;
+GWBUF	*ret;
+int	len;
+
+	if ((ret = gwbuf_alloc(5)) == NULL)
+		return 0;
+	ptr = GWBUF_DATA(ret);
+	*ptr++ = 0x01;
+	*ptr++ = 0;
+	*ptr++ = 0;
+	*ptr++ = 1;
+	*ptr = 0;		// OK 
+
+	return slave->dcb->func.write(slave->dcb, ret);
+}
+
+
+
+/**
+ * mysql_send_custom_error
+ *
+ * Send a MySQL protocol Generic ERR message, to the dcb
+ * Note the errno and state are still fixed now
+ *
+ * @param dcb Owner_Dcb Control Block for the connection to which the OK is sent
+ * @param packet_number
+ * @param in_affected_rows
+ * @param msg
+ * @return 1 Non-zero if data was sent
+ *
+ */
+int
+blr_send_custom_error(DCB *dcb, int packet_number, int affected_rows, char *msg) 
+{
+uint8_t		*outbuf = NULL;
+uint32_t	mysql_payload_size = 0;
+uint8_t		mysql_packet_header[4];
+uint8_t		*mysql_payload = NULL;
+uint8_t		field_count = 0;
+uint8_t		mysql_err[2];
+uint8_t		mysql_statemsg[6];
+unsigned int	mysql_errno = 0;
+const char	*mysql_error_msg = NULL;
+const char	*mysql_state = NULL;
+GWBUF		*errbuf = NULL;
+        
+        mysql_errno = 2003;
+        mysql_error_msg = "An errorr occurred ...";
+        mysql_state = "HY000";
+        
+        field_count = 0xff;
+        gw_mysql_set_byte2(mysql_err, mysql_errno);
+        mysql_statemsg[0]='#';
+        memcpy(mysql_statemsg+1, mysql_state, 5);
+        
+        if (msg != NULL) {
+                mysql_error_msg = msg;
+        }
+        
+        mysql_payload_size = sizeof(field_count) + 
+                                sizeof(mysql_err) + 
+                                sizeof(mysql_statemsg) + 
+                                strlen(mysql_error_msg);
+        
+        /** allocate memory for packet header + payload */
+        errbuf = gwbuf_alloc(sizeof(mysql_packet_header) + mysql_payload_size);
+        ss_dassert(errbuf != NULL);
+        
+        if (errbuf == NULL)
+        {
+                return 0;
+        }
+        outbuf = GWBUF_DATA(errbuf);
+        
+        /** write packet header and packet number */
+        gw_mysql_set_byte3(mysql_packet_header, mysql_payload_size);
+        mysql_packet_header[3] = packet_number;
+        
+        /** write header */
+        memcpy(outbuf, mysql_packet_header, sizeof(mysql_packet_header));
+        
+        mysql_payload = outbuf + sizeof(mysql_packet_header);
+        
+        /** write field */
+        memcpy(mysql_payload, &field_count, sizeof(field_count));
+        mysql_payload = mysql_payload + sizeof(field_count);
+        
+        /** write errno */
+        memcpy(mysql_payload, mysql_err, sizeof(mysql_err));
+        mysql_payload = mysql_payload + sizeof(mysql_err);
+        
+        /** write sqlstate */
+        memcpy(mysql_payload, mysql_statemsg, sizeof(mysql_statemsg));
+        mysql_payload = mysql_payload + sizeof(mysql_statemsg);
+        
+        /** write error message */
+        memcpy(mysql_payload, mysql_error_msg, strlen(mysql_error_msg));
+
+        return dcb->func.write(dcb, errbuf);
 }

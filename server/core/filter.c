@@ -91,28 +91,31 @@ filter_free(FILTER_DEF *filter)
 {
 FILTER_DEF *ptr;
 
-	/* First of all remove from the linked list */
-	spinlock_acquire(&filter_spin);
-	if (allFilters == filter)
+	if (filter)
 	{
-		allFilters = filter->next;
-	}
-	else
-	{
-		ptr = allFilters;
-		while (ptr && ptr->next != filter)
+		/* First of all remove from the linked list */
+		spinlock_acquire(&filter_spin);
+		if (allFilters == filter)
 		{
-			ptr = ptr->next;
+			allFilters = filter->next;
 		}
-		if (ptr)
-			ptr->next = filter->next;
-	}
-	spinlock_release(&filter_spin);
+		else
+		{
+			ptr = allFilters;
+			while (ptr && ptr->next != filter)
+			{
+				ptr = ptr->next;
+			}
+			if (ptr)
+				ptr->next = filter->next;
+		}
+		spinlock_release(&filter_spin);
 
-	/* Clean up session and free the memory */
-	free(filter->name);
-	free(filter->module);
-	free(filter);
+		/* Clean up session and free the memory */
+		free(filter->name);
+		free(filter->module);
+		free(filter);
+	}
 }
 
 /**
@@ -332,8 +335,7 @@ DOWNSTREAM	*me;
 		if ((filter->obj = load_module(filter->module,
 					MODULE_FILTER)) == NULL)
 		{
-			me = NULL;
-			goto retblock;
+			return NULL;
 		}
 	}
 
@@ -342,8 +344,7 @@ DOWNSTREAM	*me;
 		if ((filter->filter = (filter->obj->createInstance)(filter->options,
 					filter->parameters)) == NULL)
 		{
-			me = NULL;
-			goto retblock;
+			return NULL;
 		}
 	}
 	if ((me = (DOWNSTREAM *)calloc(1, sizeof(DOWNSTREAM))) == NULL)
@@ -355,7 +356,7 @@ DOWNSTREAM	*me;
 			errno,
 			strerror(errno))));
 		
-		goto retblock;
+		return NULL;
 	}
 	me->instance = filter->filter;
 	me->routeQuery = (void *)(filter->obj->routeQuery);
@@ -363,12 +364,10 @@ DOWNSTREAM	*me;
 	if ((me->session=filter->obj->newSession(me->instance, session)) == NULL)
 	{
 		free(me);
-		me = NULL;
-		goto retblock;
+		return NULL;
 	}
 	filter->obj->setDownstream(me->instance, me->session, downstream);
 	
-retblock:
 	return me;
 }
 

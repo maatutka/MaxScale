@@ -41,6 +41,8 @@
 #define BINLOG_NAMEFMT		"%s.%06d"
 #define BINLOG_NAME_ROOT	"mysql-bin"
 
+#define BINLOG_EVENT_HDR_LEN	19
+
 /* How often to call the binlog status function (seconds) */
 #define	BLR_STATS_FREQ		60
 #define BLR_NSTATS_MINUTES	30
@@ -64,9 +66,9 @@
  * BLR_MASTER_BACKOFF_TIME	The increments of the back off time (seconds)
  * BLR_MAX_BACKOFF		Maximum number of increments to backoff to
  */
-
-#define	BLR_MASTER_BACKOFF_TIME	5
+#define	BLR_MASTER_BACKOFF_TIME	10
 #define BLR_MAX_BACKOFF		60
+
 /**
  * Some useful macros for examining the MySQL Response packets
  */
@@ -128,6 +130,7 @@ typedef struct blfile {
  */
 typedef struct {
 	int		n_events;	/*< Number of events sent */
+	unsigned long	n_bytes;	/*< Number of bytes sent */
 	int		n_bursts;	/*< Number of bursts sent */
 	int		n_requests;	/*< Number of requests received */
 	int		n_flows;	/*< Number of flow control restarts */
@@ -138,6 +141,7 @@ typedef struct {
 	int		n_above;
 	int		n_failed_read;
 	int		n_overrun;
+	int		n_caughtup;
 	int		n_actions[3];
 	uint64_t	lastsample;
 	int		minno;
@@ -157,6 +161,7 @@ typedef struct router_slave {
 	int		binlog_pos;	/*< Binlog position for this slave */
 	char		binlogfile[BINLOG_FNAMELEN+1];
 					/*< Current binlog file for this slave */
+	char		*uuid;		/*< Slave UUID */
 	BLFILE		*file;		/*< Currently open binlog file */
 	int		serverid;	/*< Server-id of the slave */
 	char		*hostname;	/*< Hostname of the slave, if known */
@@ -175,6 +180,7 @@ typedef struct router_slave {
 			*router;	/*< Pointer to the owning router */
 	struct router_slave *next;
 	SLAVE_STATS	stats;		/*< Slave statistics */
+	time_t		connect_time;	/*< Connect time of slave */
 #if defined(SS_DEBUG)
         skygw_chk_t     rses_chk_tail;
 #endif
@@ -188,6 +194,7 @@ typedef struct {
 	int		n_slaves;	/*< Number slave sessions created     */
 	int		n_reads;	/*< Number of record reads */
 	uint64_t	n_binlogs;	/*< Number of binlog records from master */
+	uint64_t	n_binlogs_ses;	/*< Number of binlog records from master */
 	uint64_t	n_binlog_errors;/*< Number of binlog records from master */
 	uint64_t	n_rotates;	/*< Number of binlog rotate events */
 	uint64_t	n_cachehits;	/*< Number of hits on the binlog cache */
@@ -221,6 +228,8 @@ typedef struct {
 	GWBUF		*utf8;		/*< Set NAMES utf8 */
 	GWBUF		*select1;	/*< select 1 */
 	GWBUF		*selectver;	/*< select version() */
+	GWBUF		*selectvercom;	/*< select @@version_comment */
+	GWBUF		*selecthostname;/*< select @@hostname */
 	uint8_t		*fde_event;	/*< Format Description Event */
 	int		fde_len;	/*< Length of fde_event */
 } MASTER_RESPONSES;
@@ -265,10 +274,12 @@ typedef struct router_instance {
 	unsigned int	  short_burst;	/*< Short burst for slave catchup */
 	unsigned int	  long_burst;	/*< Long burst for slave catchup */
 	unsigned long	  burst_size;	/*< Maximum size of burst to send */
+	unsigned long	  heartbeat;	/*< Configured heartbeat value */
 	ROUTER_STATS	  stats;	/*< Statistics for this router */
 	int		  active_logs;
 	int		  reconnect_pending;
 	int		  retry_backoff;
+	time_t		  connect_time;
 	int		  handling_threads;
 	struct router_instance
                           *next;
@@ -278,29 +289,33 @@ typedef struct router_instance {
  * State machine for the master to MaxScale replication
  */
 #define BLRM_UNCONNECTED	0x0000
-#define	BLRM_AUTHENTICATED	0x0001
-#define BLRM_TIMESTAMP		0x0002
-#define BLRM_SERVERID		0x0003
-#define BLRM_HBPERIOD		0x0004
-#define BLRM_CHKSUM1		0x0005
-#define BLRM_CHKSUM2		0x0006
-#define BLRM_GTIDMODE		0x0007
-#define BLRM_MUUID		0x0008
-#define BLRM_SUUID		0x0009
-#define	BLRM_LATIN1		0x000A
-#define	BLRM_UTF8		0x000B
-#define	BLRM_SELECT1		0x000C
-#define	BLRM_SELECTVER		0x000D
-#define	BLRM_REGISTER		0x000E
-#define	BLRM_BINLOGDUMP		0x000F
+#define BLRM_CONNECTING		0x0001
+#define	BLRM_AUTHENTICATED	0x0002
+#define BLRM_TIMESTAMP		0x0003
+#define BLRM_SERVERID		0x0004
+#define BLRM_HBPERIOD		0x0005
+#define BLRM_CHKSUM1		0x0006
+#define BLRM_CHKSUM2		0x0007
+#define BLRM_GTIDMODE		0x0008
+#define BLRM_MUUID		0x0009
+#define BLRM_SUUID		0x000A
+#define	BLRM_LATIN1		0x000B
+#define	BLRM_UTF8		0x000C
+#define	BLRM_SELECT1		0x000D
+#define	BLRM_SELECTVER		0x000E
+#define BLRM_SELECTVERCOM	0x000F
+#define BLRM_SELECTHOSTNAME	0x0010
+#define	BLRM_REGISTER		0x0011
+#define	BLRM_BINLOGDUMP		0x0012
 
-#define BLRM_MAXSTATE		0x000F
+#define BLRM_MAXSTATE		0x0012
 
-static char *blrm_states[] = { "Unconnected", "Authenticated", "Timestamp retrieval",
+static char *blrm_states[] = { "Unconnected", "Connecting", "Authenticated", "Timestamp retrieval",
 	"Server ID retrieval", "HeartBeat Period setup", "binlog checksum config",
 	"binlog checksum rerieval", "GTID Mode retrieval", "Master UUID retrieval",
 	"Set Slave UUID", "Set Names latin1", "Set Names utf8", "select 1",
-	"select version()", "Register slave", "Binlog Dump" };
+	"select version()", "select @@version_comment", "select @@hostname",
+	"Register slave", "Binlog Dump" };
 
 #define BLRS_CREATED		0x0000
 #define BLRS_UNREGISTERED	0x0001
@@ -329,6 +344,8 @@ static char *blrs_states[] = { "Created", "Unregistered", "Registered",
  */
 #define	COM_QUIT				0x01
 #define	COM_QUERY				0x03
+#define	COM_STATISTICS				0x09
+#define	COM_PING				0x0e
 #define COM_REGISTER_SLAVE			0x15
 #define COM_BINLOG_DUMP				0x12
 
@@ -370,6 +387,8 @@ static char *blrs_states[] = { "Created", "Unregistered", "Registered",
 #define GTID_EVENT				0x21
 #define ANONYMOUS_GTID_EVENT			0x22
 #define PREVIOUS_GTIDS_EVENT			0x23
+
+#define MAX_EVENT_TYPE				0x23
 
 /**
  * Binlog event flags
@@ -418,9 +437,9 @@ extern void blr_slave_rotate(ROUTER_SLAVE *slave, uint8_t *ptr);
 extern int blr_slave_catchup(ROUTER_INSTANCE *router, ROUTER_SLAVE *slave, bool large);
 extern void blr_init_cache(ROUTER_INSTANCE *);
 
-extern void blr_file_init(ROUTER_INSTANCE *);
-extern void blr_write_binlog_record(ROUTER_INSTANCE *, REP_HEADER *,uint8_t *);
-extern void blr_file_rotate(ROUTER_INSTANCE *, char *, uint64_t);
+extern int  blr_file_init(ROUTER_INSTANCE *);
+extern int  blr_write_binlog_record(ROUTER_INSTANCE *, REP_HEADER *,uint8_t *);
+extern int  blr_file_rotate(ROUTER_INSTANCE *, char *, uint64_t);
 extern void blr_file_flush(ROUTER_INSTANCE *);
 extern BLFILE *blr_open_binlog(ROUTER_INSTANCE *, char *);
 extern GWBUF *blr_read_binlog(ROUTER_INSTANCE *, BLFILE *, unsigned int, REP_HEADER *);

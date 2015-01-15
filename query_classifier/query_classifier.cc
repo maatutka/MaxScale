@@ -67,28 +67,18 @@ extern __thread log_info_t tls_log_info;
 
 #define QTYPE_LESS_RESTRICTIVE_THAN_WRITE(t) (t<QUERY_TYPE_WRITE ? true : false)
 
-static THD* get_or_create_thd_for_parsing(
-        MYSQL* mysql,
-        char*  query_str);
-
-static unsigned long set_client_flags(
-        MYSQL* mysql);
-
-static bool create_parse_tree(
-        THD* thd);
-
-static skygw_query_type_t resolve_query_type(
-        THD* thd);
-
+static THD* get_or_create_thd_for_parsing(MYSQL* mysql, char* query_str);
+static unsigned long set_client_flags(MYSQL* mysql);
+static bool create_parse_tree(THD* thd);
+static skygw_query_type_t resolve_query_type(THD* thd);
 static bool skygw_stmt_causes_implicit_commit(
         LEX*  lex,
         int* autocommit_stmt);
 
-static int is_autocommit_stmt(
-        LEX* lex);
+static int is_autocommit_stmt(LEX* lex);
+static void parsing_info_set_plain_str(void* ptr, char* str);
+static void* skygw_get_affected_tables(void* lexptr);
 
-static void parsing_info_set_plain_str(void* ptr, 
-        char* str);
 
 /**
  * Calls parser for the query includede in the buffer. Creates and adds parsing 
@@ -107,6 +97,11 @@ skygw_query_type_t query_classifier_get_type(
         
         ss_info_dassert(querybuf != NULL, ("querybuf is NULL"));
         
+	if (querybuf == NULL)
+	{
+		succp = false;
+		goto retblock;
+	}
         /** Create parsing info for the query and store it to buffer */
         succp = query_is_parsed(querybuf);
         
@@ -133,6 +128,7 @@ skygw_query_type_t query_classifier_get_type(
                         }
                 }
         }
+retblock:
         return qtype;
 }
 
@@ -151,14 +147,14 @@ bool parse_query (
         THD*            thd;
         uint8_t*        data;
         size_t          len;
-        char*           query_str;
+        char*           query_str = NULL;
         parsing_info_t* pi;
         
         CHK_GWBUF(querybuf);
         /** Do not parse without releasing previous parse info first */
         ss_dassert(!query_is_parsed(querybuf));
          
-        if (query_is_parsed(querybuf))
+        if (querybuf == NULL || query_is_parsed(querybuf))
         {
                 return false;
         }
@@ -173,9 +169,9 @@ bool parse_query (
         /** Extract query and copy it to different buffer */
         data = (uint8_t*)GWBUF_DATA(querybuf);
         len = MYSQL_GET_PACKET_LEN(data)-1; /*< distract 1 for packet type byte */        
-        query_str = (char *)malloc(len+1);
         
-        if (query_str == NULL)
+
+        if (len < 1 || len >= ~((size_t)0) - 1 || (query_str = (char *)malloc(len+1)) == NULL)
         {
                 /** Free parsing info data */
                 parsing_info_done(pi);
@@ -225,7 +221,7 @@ bool query_is_parsed(
         GWBUF* buf)
 {
         CHK_GWBUF(buf);
-        return GWBUF_IS_PARSED(buf);
+        return (buf != NULL && GWBUF_IS_PARSED(buf));
 }
 
 
@@ -362,50 +358,29 @@ static bool create_parse_tree(
         Parser_state parser_state;
         bool         failp = FALSE;
         const char*  virtual_db = "skygw_virtual";
-#if defined(SS_DEBUG_EXTRA)
-	LOGIF(LM, (skygw_log_write_flush(
-		LOGFILE_MESSAGE,
-		"[readwritesplit:create_parse_tree] 1.")));
-#endif
-        if (parser_state.init(thd, thd->query(), thd->query_length())) {
+
+	if (parser_state.init(thd, thd->query(), thd->query_length())) 
+	{
                 failp = TRUE;
                 goto return_here;
         }
-#if defined(SS_DEBUG_EXTRA)
-        LOGIF(LM, (skygw_log_write_flush(
-		LOGFILE_MESSAGE,
-		"[readwritesplit:create_parse_tree] 2.")));
-#endif	
 	mysql_reset_thd_for_next_command(thd);
 
-#if defined(SS_DEBUG_EXTRA)	
-	LOGIF(LM, (skygw_log_write_flush(
-		LOGFILE_MESSAGE,
-		"[readwritesplit:create_parse_tree] 3.")));
-#endif
         /** 
 	 * Set some database to thd so that parsing won't fail because of
          * missing database. Then parse. 
 	 */
         failp = thd->set_db(virtual_db, strlen(virtual_db));
-#if defined(SS_DEBUG_EXTRA)	
-	LOGIF(LM, (skygw_log_write_flush(
-		LOGFILE_MESSAGE,
-		"[readwritesplit:create_parse_tree] 4.")));
-#endif
-        if (failp) {
+        if (failp) 
+	{
                 LOGIF(LE, (skygw_log_write_flush(
                         LOGFILE_ERROR,
                         "Error : Failed to set database in thread context.")));
         }
         failp = parse_sql(thd, &parser_state, NULL);
 
-#if defined(SS_DEBUG_EXTRA)
-	LOGIF(LM, (skygw_log_write_flush(
-		LOGFILE_MESSAGE,
-		"[readwritesplit:create_parse_tree] 5.")));
-#endif	
-        if (failp) {
+        if (failp) 
+	{
                 LOGIF(LD, (skygw_log_write(
                         LOGFILE_DEBUG,
                         "%lu [readwritesplit:create_parse_tree] failed to "
@@ -417,16 +392,14 @@ return_here:
 }
 
 /** 
- * @node Set new query type if new is more restrictive than old. 
+ * Set new query type if new is more restrictive than old. 
  *
  * Parameters:
- * @param qtype - <usage>
- *          <description>
+ * @param qtype		Existing type
  *
- * @param new_type - <usage>
- *          <description>
+ * @param new_type	New query type
  *
- * @return 
+ * @return Query type as an unsigned int value which must be casted to qtype.
  *
  * 
  * @details The implementation relies on that enumerated values correspond
@@ -443,13 +416,11 @@ static u_int32_t set_query_type(
 }
 
 /** 
- * @node Detect query type, read-only, write, or session update 
+ * Detect query type by examining parsed representation of it.
  *
- * Parameters:
- * @param thd - <usage>
- *          <description>
+ * @param thd	MariaDB thread context.
  *
- * @return 
+ * @return Copy of query type value. 
  *
  * 
  * @details Query type is deduced by checking for certain properties
@@ -474,7 +445,7 @@ static skygw_query_type_t resolve_query_type(
          * all write operations to all nodes.
          */
 #if defined(NOT_IN_USE)
-        bool               force_data_modify_op_replication;
+        bool force_data_modify_op_replication;
 	force_data_modify_op_replication = FALSE;	
 #endif /* NOT_IN_USE */
         ss_info_dassert(thd != NULL, ("thd is NULL\n"));
@@ -619,6 +590,7 @@ static skygw_query_type_t resolve_query_type(
                         break;
 
                 case SQLCOM_SELECT:
+		case SQLCOM_SHOW_SLAVE_STAT:
                         type |= QUERY_TYPE_READ;
                         break;
 
@@ -867,6 +839,11 @@ return_qtype:
  * Checks if statement causes implicit COMMIT.
  * autocommit_stmt gets values 1, 0 or -1 if stmt is enable, disable or 
  * something else than autocommit. 
+ * 
+ * @param lex			Parse tree
+ * @param autocommit_stmt	memory address for autocommit status
+ * 
+ * @return true if statement causes implicit commit and false otherwise
  */
 static bool skygw_stmt_causes_implicit_commit(
         LEX*  lex,
@@ -896,7 +873,7 @@ static bool skygw_stmt_causes_implicit_commit(
                         }
                         else 
                         {
-                                succp  =false;
+                                succp = false;
                         }
                         break;
                 default:
@@ -912,7 +889,9 @@ return_succp:
  * Finds out if stmt is SET autocommit
  * and if the new value matches with the enable_cmd argument.
  * 
- * Returns 1, 0, or -1 if command was:
+ * @param lex	parse tree
+ * 
+ * @return 1, 0, or -1 if command was:
  * enable, disable, or not autocommit, respectively.
  */
 static int is_autocommit_stmt(
@@ -974,47 +953,59 @@ return_rc:
         return rc;
 }
 
-
+#if defined(NOT_USED)
 char* skygw_query_classifier_get_stmtname(
-        MYSQL* mysql)
+	GWBUF* buf)
 {
+	MYSQL* mysql;
+	
+	if (buf == NULL ||
+		buf->gwbuf_bufobj == NULL ||
+		buf->gwbuf_bufobj->bo_data == NULL ||
+		(mysql = (MYSQL *)((parsing_info_t *)buf->gwbuf_bufobj->bo_data)->pi_handle) == NULL ||
+		mysql->thd == NULL || 
+		(THD *)(mysql->thd))->lex == NULL || 
+		(THD *)(mysql->thd))->lex->prepared_stmt_name == NULL)
+	{
+		return NULL;
+	}
         return ((THD *)(mysql->thd))->lex->prepared_stmt_name.str;
-        
 }
+#endif
 
 /**
- *Returns the LEX struct of the parsed GWBUF
- *@param The parsed GWBUF
- *@return Pointer to the LEX struct or NULL if an error occurred or the query was not parsed
+ * Get the parse tree from parsed querybuf.
+ * @param querybuf	The parsed GWBUF
+ * 
+ * @return Pointer to the LEX struct or NULL if an error occurred or the query
+ * was not parsed
  */
 LEX* get_lex(GWBUF* querybuf)
 {
 
-  parsing_info_t* pi;
-  MYSQL*          mysql;
-  THD*            thd;
-        
-  if (!GWBUF_IS_PARSED(querybuf))
-    {
-      return NULL;
-    }
-  pi = (parsing_info_t *)gwbuf_get_buffer_object_data(querybuf, 
-						      GWBUF_PARSING_INFO);
+	parsing_info_t* pi;
+	MYSQL*          mysql;
+	THD*            thd;
+		
+	if (querybuf == NULL || !GWBUF_IS_PARSED(querybuf))
+	{
+		return NULL;
+	}
+	pi = (parsing_info_t *)gwbuf_get_buffer_object_data(querybuf, 
+							    GWBUF_PARSING_INFO);
 
-  if (pi == NULL)
-    {
-      return NULL;
-    }
-        
-  if ((mysql = (MYSQL *)pi->pi_handle) == NULL || 
-      (thd = (THD *)mysql->thd) == NULL)
-    {
-      ss_dassert(mysql != NULL && 
-		 thd != NULL);
-      return NULL;
-    }
-
-  return thd->lex;
+	if (pi == NULL)
+	{
+		return NULL;
+	}
+		
+	if ((mysql = (MYSQL *)pi->pi_handle) == NULL || 
+		(thd = (THD *)mysql->thd) == NULL)
+	{
+		ss_dassert(mysql != NULL && thd != NULL);
+		return NULL;
+	}
+	return thd->lex;
 }
 
 
@@ -1024,7 +1015,7 @@ LEX* get_lex(GWBUF* querybuf)
  * @param thd Pointer to a valid THD
  * @return Pointer to the head of the TABLE_LIST chain or NULL in case of an error
  */
-void* skygw_get_affected_tables(void* lexptr)
+static void* skygw_get_affected_tables(void* lexptr)
 {
         LEX* lex = (LEX*)lexptr;
         
@@ -1042,87 +1033,94 @@ void* skygw_get_affected_tables(void* lexptr)
 
 /**
  * Reads the parsetree and lists all the affected tables and views in the query.
- * In the case of an error, the size of the table is set to zero and no memory is allocated.
- * The caller must free the allocated memory.
+ * In the case of an error, the size of the table is set to zero and no memory 
+ * is allocated. The caller must free the allocated memory.
  *
  * @param querybuf GWBUF where the table names are extracted from
  * @param tblsize Pointer where the number of tables is written
  * @return Array of null-terminated strings with the table names
  */
-char** skygw_get_table_names(GWBUF* querybuf,int* tblsize, bool fullnames)
+char** skygw_get_table_names(GWBUF* querybuf, int* tblsize, bool fullnames)
 {
-  LEX*			lex;
-  TABLE_LIST*		tbl;
-  int			i = 0,
+	LEX*		lex;
+	TABLE_LIST*	tbl;
+	int		i = 0,
 			currtblsz = 0;
-  char			**tables = NULL,
+	char		**tables = NULL,
 			**tmp = NULL;
 
-  if( (lex = get_lex(querybuf)) == NULL || 
-	  lex->current_select == NULL )
+	if(querybuf == NULL || 
+		tblsize == NULL || 
+		(lex = get_lex(querybuf)) == NULL || 
+		lex->current_select == NULL)
 	{
-      goto retblock;
-    }        
+		goto retblock;
+	}        
 
-  lex->current_select = lex->all_selects_list;
+	lex->current_select = lex->all_selects_list;
 
-  while(lex->current_select){
-    
-    tbl = (TABLE_LIST*)skygw_get_affected_tables(lex);
+	while(lex->current_select)
+	{
+		tbl = (TABLE_LIST*)skygw_get_affected_tables(lex);
 
-    while (tbl) 
-      {
-	if(i >= currtblsz){
-	  
-	  tmp = (char**)malloc(sizeof(char*)*(currtblsz*2+1));
-
-	  if(tmp){
-	    if(currtblsz > 0){
-	      int x;
-	      for(x = 0;x<currtblsz;x++){
-		tmp[x] = tables[x]; 
-	      }
-	      free(tables);
-	    }
-
-	    tables = tmp;
-	    currtblsz = currtblsz*2 + 1;
-
-	  }	  
-	  
-	}
-	if(tmp != NULL){
-		char *catnm = NULL;
-
-		if(fullnames)
+		while (tbl) 
+		{
+			if (i >= currtblsz)
 			{
-				if(tbl->db && strcmp(tbl->db,"skygw_virtual") != 0)
+				tmp = (char**)malloc(sizeof(char*)*(currtblsz*2+1));
+
+				if(tmp)
+				{
+					if(currtblsz > 0)
 					{
-						catnm = (char*)calloc(strlen(tbl->db) + strlen(tbl->table_name) + 2,sizeof(char));
+						int x;
+						for(x = 0; x<currtblsz; x++)
+						{
+							tmp[x] = tables[x]; 
+						}
+						free(tables);
+					}
+					tables = tmp;
+					currtblsz = currtblsz*2 + 1;
+				}
+			}
+			
+			if(tmp != NULL)
+			{
+				char *catnm = NULL;
+				
+				if(fullnames)
+				{
+					if (tbl->db && 
+						strcmp(tbl->db,"skygw_virtual") != 0)
+					{
+						catnm = (char*)calloc(strlen(tbl->db) + 
+							strlen(tbl->table_name) + 
+							2,
+						sizeof(char));
 						strcpy(catnm,tbl->db);
 						strcat(catnm,".");
 						strcat(catnm,tbl->table_name);
 					}
+				}
+			
+				if(catnm)
+				{
+					tables[i++] = catnm;
+				}
+				else
+				{
+					tables[i++] = strdup(tbl->table_name);
+				}
+				tbl=tbl->next_local;
 			}
-	
-		if(catnm)
-			{
-				tables[i++] = catnm;
-			}
-		else
-			{
-				tables[i++] = strdup(tbl->table_name);
-			}
-
-		tbl=tbl->next_local;
-	}
-      }
-    lex->current_select = lex->current_select->next_select_in_list();
-  }
-
- retblock:
-  *tblsize = i;
-  return tables;
+		} /*< while (tbl) */
+		lex->current_select = lex->current_select->next_select_in_list();
+	} /*< while(lex->current_select) */
+retblock:
+        if(tblsize)
+            *tblsize = i;
+	return tables;
 }
 
 /**
@@ -1132,52 +1130,70 @@ char** skygw_get_table_names(GWBUF* querybuf,int* tblsize, bool fullnames)
  */
 char* skygw_get_created_table_name(GWBUF* querybuf)
 {
-  LEX* lex;
-  
-  if((lex = get_lex(querybuf)) == NULL)
-    {
-      return NULL;
-    }
+	LEX* lex;
+	
+	if(querybuf == NULL || (lex = get_lex(querybuf)) == NULL)
+	{
+		return NULL;
+	}
 
-  if(lex->create_last_non_select_table && 
-     lex->create_last_non_select_table->table_name){
-    char* name = strdup(lex->create_last_non_select_table->table_name);
-    return name;
-  }else{
-    return NULL;
-  }
-  
+	if (lex->create_last_non_select_table && 
+		lex->create_last_non_select_table->table_name)
+	{
+		char* name = strdup(lex->create_last_non_select_table->table_name);
+		return name;
+	}
+	else
+	{
+		return NULL;
+	}
 }
 
 /**
- * Checks whether the query is a "real" query ie. SELECT,UPDATE,INSERT,DELETE or any variation of these.
- * Queries that affect the underlying database are not considered as real queries and the queries that target
- * specific row or variable data are regarded as the real queries.
+ * Checks whether the query is a "real" query ie. SELECT,UPDATE,INSERT,DELETE or 
+ * any variation of these. Queries that affect the underlying database are not 
+ * considered as real queries and the queries that target specific row or 
+ * variable data are regarded as the real queries.
+ * 
  * @param GWBUF to analyze
+ * 
  * @return true if the query is a real query, otherwise false
  */
 bool skygw_is_real_query(GWBUF* querybuf)
 {
-  LEX* lex = get_lex(querybuf);
-  if(lex){
-    switch(lex->sql_command){
-    case SQLCOM_SELECT:
-      return lex->all_selects_list->table_list.elements > 0;
-    case SQLCOM_UPDATE:
-    case SQLCOM_INSERT:
-    case SQLCOM_INSERT_SELECT:
-    case SQLCOM_DELETE:
-    case SQLCOM_TRUNCATE:
-    case SQLCOM_REPLACE:
-    case SQLCOM_REPLACE_SELECT:
-    case SQLCOM_PREPARE:
-    case SQLCOM_EXECUTE:
-      return true;
-    default:
-      return false;
+	bool succp;
+	LEX* lex;
+	
+	if (querybuf == NULL ||
+		(lex = get_lex(querybuf)) == NULL)
+	{
+		succp = false;
+		goto retblock;
 	}
-  }
-  return false;
+	switch(lex->sql_command) {
+		case SQLCOM_SELECT:
+			succp = lex->all_selects_list->table_list.elements > 0;
+			goto retblock;
+			break;
+		case SQLCOM_UPDATE:
+		case SQLCOM_INSERT:
+		case SQLCOM_INSERT_SELECT:
+		case SQLCOM_DELETE:
+		case SQLCOM_TRUNCATE:
+		case SQLCOM_REPLACE:
+		case SQLCOM_REPLACE_SELECT:
+		case SQLCOM_PREPARE:
+		case SQLCOM_EXECUTE:
+			succp = true;
+			goto retblock;
+			break;
+		default:
+			succp = false;
+			goto retblock;
+			break;
+	}
+retblock:
+	return succp;
 }
 
 
@@ -1188,11 +1204,14 @@ bool skygw_is_real_query(GWBUF* querybuf)
  */
 bool is_drop_table_query(GWBUF* querybuf)
 {
-  LEX* lex;
+	LEX* lex;
         
-  return (lex = get_lex(querybuf)) != NULL &&
-	  lex->sql_command == SQLCOM_DROP_TABLE;
+	return (querybuf != NULL &&
+		(lex = get_lex(querybuf)) != NULL &&
+		lex->sql_command == SQLCOM_DROP_TABLE);
 }
+
+
 
 inline void add_str(char** buf, int* buflen, int* bufsize, char* str)
 {
@@ -1211,6 +1230,7 @@ inline void add_str(char** buf, int* buflen, int* bufsize, char* str)
 		}
 
 	if(*buflen > 0){
+            if(*buf)
 		strcat(*buf," ");
 	}
 	strcat(*buf,str);
@@ -1287,6 +1307,7 @@ char* skygw_get_affected_fields(GWBUF* buf)
 bool skygw_query_has_clause(GWBUF* buf)
 {
 	LEX* lex;
+	SELECT_LEX* current;
 	bool clause = false;
 	
 	if(!query_is_parsed(buf)){
@@ -1297,15 +1318,15 @@ bool skygw_query_has_clause(GWBUF* buf)
 		return false;
 	}
 	
-	lex->current_select = lex->all_selects_list;
+    current = lex->all_selects_list;
 	
-	while(lex->current_select)
+	while(current)
 		{
-			if(lex->current_select->where || lex->current_select->having){
+			if(current->where || current->having){
 				clause = true;
 			}
 		    
-			lex->current_select = lex->current_select->next_select_in_list();
+		    current = current->next_select_in_list();
 		}
 	return clause;
 }
@@ -1333,7 +1354,8 @@ char* skygw_get_canonical(
         Item*           item;
         char*           querystr;
         
-        if (!GWBUF_IS_PARSED(querybuf))
+        if (querybuf == NULL ||
+		!GWBUF_IS_PARSED(querybuf))
         {
                 querystr = NULL;
                 goto retblock;
@@ -1470,25 +1492,30 @@ retblock:
 void parsing_info_done(
         void* ptr)
 {
-        parsing_info_t* pi = (parsing_info_t *)ptr;
+        parsing_info_t* pi;
+	
+	if (ptr)
+	{
+		pi = (parsing_info_t *)ptr;
         
-        if (pi->pi_handle != NULL)
-        {
-                MYSQL* mysql = (MYSQL *)pi->pi_handle;
-                
-                if (mysql->thd != NULL)
-                {
-                        (*mysql->methods->free_embedded_thd)(mysql);
-                        mysql->thd = NULL;
-                }
-                mysql_close(mysql);
-        }
-        /** Free plain text query string */
-        if (pi->pi_query_plain_str != NULL)
-        {
-                free(pi->pi_query_plain_str);
-        }
-        free(pi);
+		if (pi->pi_handle != NULL)
+		{
+			MYSQL* mysql = (MYSQL *)pi->pi_handle;
+			
+			if (mysql->thd != NULL)
+			{
+				(*mysql->methods->free_embedded_thd)(mysql);
+				mysql->thd = NULL;
+			}
+			mysql_close(mysql);
+		}
+		/** Free plain text query string */
+		if (pi->pi_query_plain_str != NULL)
+		{
+			free(pi->pi_query_plain_str);
+		}
+		free(pi);
+	}
 }
 
 /**
@@ -1519,7 +1546,7 @@ static void parsing_info_set_plain_str(
  * @return	string representing the query type value
  */
 char* skygw_get_qtype_str(
-						  skygw_query_type_t qtype)
+	skygw_query_type_t qtype)
 {
 	int                t1 = (int)qtype;
 	int                t2 = 1;
@@ -1531,29 +1558,31 @@ char* skygw_get_qtype_str(
 	 * t1 is completely cleared.
 	 */
 	while (t1 != 0)
-		{		
-			if (t1&t2)
-				{
-					t = (skygw_query_type_t)t2;
+	{		
+		if (t1&t2)
+		{
+			t = (skygw_query_type_t)t2;
 
-					if (qtype_str == NULL)
-						{
-							qtype_str = strdup(STRQTYPE(t));
-						}
-					else
-						{
-							size_t len = strlen(STRQTYPE(t));
-							/** reallocate space for delimiter, new string and termination */
-							qtype_str = (char *)realloc(qtype_str, strlen(qtype_str)+1+len+1);
-							snprintf(qtype_str+strlen(qtype_str), 1+len+1, "|%s", STRQTYPE(t));
-						}
-					/** Remove found value from t1 */
-					t1 &= ~t2;
-				}
-			t2 <<= 1;
+			if (qtype_str == NULL)
+			{
+				qtype_str = strdup(STRQTYPE(t));
+			}
+			else
+			{
+				size_t len = strlen(STRQTYPE(t));
+				/** reallocate space for delimiter, new string and termination */
+				qtype_str = (char *)realloc(qtype_str, strlen(qtype_str)+1+len+1);
+				snprintf(qtype_str+strlen(qtype_str), 1+len+1, "|%s", STRQTYPE(t));
+			}
+			/** Remove found value from t1 */
+			t1 &= ~t2;
 		}
+		t2 <<= 1;
+	}
 	return qtype_str;
 }
+
+
 skygw_query_op_t query_classifier_get_operation(GWBUF* querybuf)
 {
 	LEX* lex = get_lex(querybuf);
